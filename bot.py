@@ -13,6 +13,8 @@ load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 OPUS_LIBRARY_PATH = os.getenv("OPUS_LIBRARY_PATH")
+PORT = os.getenv("PORT")
+HEALTH_HOST = os.getenv("HEALTH_HOST", "0.0.0.0")
 
 if OPUS_LIBRARY_PATH:
     discord.opus.load_opus(OPUS_LIBRARY_PATH)
@@ -322,13 +324,55 @@ async def on_ready() -> None:
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
 
+async def handle_health_check(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+) -> None:
+    try:
+        await asyncio.wait_for(reader.read(1024), timeout=1)
+    except asyncio.TimeoutError:
+        pass
+
+    body = b"OK"
+    writer.write(
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: text/plain\r\n"
+        b"Content-Length: 2\r\n"
+        b"Connection: close\r\n"
+        b"\r\n"
+        + body
+    )
+    await writer.drain()
+    writer.close()
+    await writer.wait_closed()
+
+
+async def start_health_server() -> asyncio.Server | None:
+    if not PORT:
+        return None
+
+    try:
+        port = int(PORT)
+    except ValueError as exc:
+        raise RuntimeError("PORT must be a number.") from exc
+
+    server = await asyncio.start_server(handle_health_check, HEALTH_HOST, port)
+    print(f"Health check listening on {HEALTH_HOST}:{port}")
+    return server
+
+
 async def main() -> None:
     if not TOKEN:
         raise RuntimeError("DISCORD_TOKEN environment variable is required.")
 
-    async with bot:
-        await bot.add_cog(Music(bot))
-        await bot.start(TOKEN)
+    health_server = await start_health_server()
+    try:
+        async with bot:
+            await bot.add_cog(Music(bot))
+            await bot.start(TOKEN)
+    finally:
+        if health_server:
+            health_server.close()
+            await health_server.wait_closed()
 
 
 if __name__ == "__main__":

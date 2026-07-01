@@ -17,6 +17,8 @@ pip install -r requirements.txt
 4. Copy `.env.example` to `.env` and fill in `DISCORD_TOKEN`.
 5. Enable the Message Content Intent for the bot in the Discord Developer Portal.
 
+`PORT` is optional. When set, the bot opens a small HTTP health check that returns `OK`.
+
 ## Run
 
 ```bash
