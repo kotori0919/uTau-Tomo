@@ -38,6 +38,12 @@ SYNC_GUILD_ID = os.getenv("DISCORD_GUILD_ID")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://192.168.0.42:11434").rstrip("/")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma4-E4B-Unhold:latest")
 OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "180"))
+WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "true").lower() not in {
+    "0",
+    "false",
+    "no",
+}
+WEB_SEARCH_MAX_RESULTS = int(os.getenv("WEB_SEARCH_MAX_RESULTS", "5"))
 
 DATA_DIR = Path(os.getenv("BOT_DATA_DIR", "data"))
 MEMORY_DB_PATH = Path(os.getenv("MEMORY_DB_PATH", DATA_DIR / "memory.sqlite3"))
@@ -112,6 +118,13 @@ class VoiceConversationState:
     monitor_task: asyncio.Task
     always_reply: bool = True
     processing_users: set[int] = field(default_factory=set)
+
+
+@dataclass
+class WebSearchResult:
+    title: str
+    url: str
+    snippet: str
 
 
 async def send_interaction(
@@ -449,10 +462,37 @@ class OllamaClient:
         return clean_model_response(answer)
 
 
+class WebSearchClient:
+    def __init__(self, enabled: bool, max_results: int):
+        self.enabled = enabled
+        self.max_results = max(1, max_results)
+
+    async def search(self, query: str) -> list[WebSearchResult]:
+        if not self.enabled:
+            return []
+        return await asyncio.to_thread(self._search_sync, query)
+
+    def _search_sync(self, query: str) -> list[WebSearchResult]:
+        from ddgs import DDGS
+
+        results: list[WebSearchResult] = []
+        with DDGS() as ddgs:
+            for result in ddgs.text(query, max_results=self.max_results):
+                title = str(result.get("title") or "").strip()
+                url = str(result.get("href") or result.get("url") or "").strip()
+                snippet = str(result.get("body") or "").strip()
+                if title and url:
+                    results.append(WebSearchResult(title=title, url=url, snippet=snippet))
+        return results
+
+
 class AIConversationService:
-    def __init__(self, store: MemoryStore, client: OllamaClient):
+    def __init__(
+        self, store: MemoryStore, client: OllamaClient, web_search: WebSearchClient
+    ):
         self.store = store
         self.client = client
+        self.web_search = web_search
         self.compress_lock = asyncio.Lock()
 
     async def answer(
@@ -475,6 +515,17 @@ class AIConversationService:
         answer = await self.client.generate(
             prompt, media_paths=[media_path] if media_path is not None else None
         )
+        search_query = self.extract_search_query(answer)
+        if search_query:
+            search_results = await self.web_search.search(search_query)
+            if not search_results:
+                answer = "웹검색을 시도했지만 검색 결과를 가져오지 못했어요."
+            else:
+                answer = await self.client.generate(
+                    self.build_search_answer_prompt(prompt, search_query, search_results),
+                    media_paths=[media_path] if media_path is not None else None,
+                )
+
         if answer.strip().upper() == "NO_REPLY":
             return None
 
@@ -521,11 +572,18 @@ class AIConversationService:
         elif media_path is not None and media_path.suffix.lower() in IMAGE_SUFFIXES:
             current_input = f"{content}\n\n첨부된 이미지를 보고, 텍스트 요청과 함께 답하세요."
 
+        web_search_instruction = (
+            "\n최신 정보, 현재 상태, 가격, 일정, 규정, 뉴스, 외부 사실 확인이 필요한 경우 "
+            "답변 대신 정확히 `WEB_SEARCH: 검색어` 한 줄만 출력하세요."
+            if self.web_search.enabled
+            else ""
+        )
+
         return f"""
 당신은 Discord 서버의 한국어 AI 대화 봇입니다.
 사용자별 장기 memory, 최근 대화, 서버의 공유 문맥을 참고해 자연스럽고 짧게 답하세요.
 서버 공유 문맥은 참고용이며, 다른 사용자의 사적인 정보를 단정하거나 노출하지 마세요.
-내부 추론이나 thought 태그를 출력하지 말고 최종 답변만 출력하세요.{voice_instruction}
+내부 추론이나 thought 태그를 출력하지 말고 최종 답변만 출력하세요.{voice_instruction}{web_search_instruction}
 
 [현재 사용자]
 {user.display_name} ({user.id})
@@ -544,6 +602,38 @@ class AIConversationService:
 
 [현재 요청]
 {current_input}
+""".strip()
+
+    def extract_search_query(self, answer: str) -> str | None:
+        match = re.search(r"(?im)^\s*WEB_SEARCH\s*:\s*(.+?)\s*$", answer)
+        if not match:
+            return None
+        query = match.group(1).strip().strip("\"'")
+        return query[:300] or None
+
+    def build_search_answer_prompt(
+        self,
+        original_prompt: str,
+        query: str,
+        results: list[WebSearchResult],
+    ) -> str:
+        formatted_results = "\n".join(
+            f"[{index}] {result.title}\nURL: {result.url}\n요약: {result.snippet[:700]}"
+            for index, result in enumerate(results, start=1)
+        )
+        return f"""
+아래는 사용자의 원래 대화 context와 웹검색 결과입니다.
+검색 결과에 근거해 한국어로 답하세요. 확실하지 않은 부분은 모른다고 말하세요.
+가능하면 관련 URL을 1개 이상 포함하세요. 내부 추론은 출력하지 마세요.
+
+[원래 context]
+{original_prompt}
+
+[검색 query]
+{query}
+
+[WEB_RESULTS]
+{formatted_results}
 """.strip()
 
     async def compress_if_needed(self, guild_id: int, user_id: int) -> None:
@@ -1334,7 +1424,10 @@ bot.synced_commands = False
 
 memory_store = MemoryStore(MEMORY_DB_PATH)
 ollama_client = OllamaClient(OLLAMA_URL, OLLAMA_MODEL, OLLAMA_TIMEOUT)
-conversation_service = AIConversationService(memory_store, ollama_client)
+web_search_client = WebSearchClient(WEB_SEARCH_ENABLED, WEB_SEARCH_MAX_RESULTS)
+conversation_service = AIConversationService(
+    memory_store, ollama_client, web_search_client
+)
 supertonic_speaker = SupertonicSpeaker(memory_store)
 
 

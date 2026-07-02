@@ -39,6 +39,10 @@ OLLAMA_URL=http://192.168.0.42:11434
 OLLAMA_MODEL=gemma4-E4B-Unhold:latest
 OLLAMA_TIMEOUT=180
 
+# Web search for AI answers
+WEB_SEARCH_ENABLED=true
+WEB_SEARCH_MAX_RESULTS=5
+
 # Local data and memory
 BOT_DATA_DIR=data
 MEMORY_DB_PATH=data/memory.sqlite3
@@ -85,6 +89,8 @@ Example:
 ```
 
 Audio/image attachments on a mention are passed to Ollama as multimodal inputs when the model/runtime supports them.
+
+When the model decides that current external information is needed, it can request a web search. The bot runs the search with `ddgs`, injects the results back into Gemma, and asks it to answer with source URLs.
 
 ## Voice And TTS Notes
 
