@@ -1,0 +1,34 @@
+DISCORD_TOKEN=
+DISCORD_GUILD_ID=
+
+LLM_BACKEND=ollama
+LLM_URL=http://192.168.0.42:11434
+LLM_MODEL=SuperQwen-AgentWorld-35B-A3B:Q4
+LLM_TIMEOUT=180
+LLM_MAX_TOKENS=2048
+LLM_TOOL_MAX_STEPS=2
+LLM_FALLBACK_ENABLED=false
+AI_PROMPT_PATH=ai_prompt.md
+
+# Web search for AI answers.
+WEB_SEARCH_ENABLED=true
+WEB_SEARCH_MAX_RESULTS=3
+
+BOT_DATA_DIR=data
+MEMORY_DB_PATH=data/memory.sqlite3
+MAX_PLAYLIST_TRACKS=100
+
+SUPERTONIC_DEFAULT_VOICE=M4
+SUPERTONIC_DEFAULT_LANG=ko
+SUPERTONIC_MAX_CHARS=700
+
+# Optional. Required only if you want /voice_refer to convert audio directly to
+# Supertonic 3 voice-style JSON through your own local converter.
+# SUPERTONIC_VOICE_BUILDER_CMD=/path/to/build_voice --input {input} --output {output}
+
+# Optional health check.
+# PORT=8080
+# HEALTH_HOST=0.0.0.0
+
+# Optional opus override.
+# OPUS_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu/libopus.so.0

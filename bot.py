@@ -2,17 +2,25 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import html
+import io
+import json
+import math
 import os
+import random
 import re
 import shlex
 import sqlite3
 import subprocess
 import time
+import unicodedata
 import wave
 from collections import deque
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
+from urllib.parse import urljoin, urlparse
 
 import aiohttp
 import discord
@@ -35,15 +43,38 @@ PORT = os.getenv("PORT")
 HEALTH_HOST = os.getenv("HEALTH_HOST", "0.0.0.0")
 SYNC_GUILD_ID = os.getenv("DISCORD_GUILD_ID")
 
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://192.168.0.42:11434").rstrip("/")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma4-E4B-Unhold:latest")
-OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "180"))
+LLM_BACKEND = os.getenv("LLM_BACKEND", "ollama").strip().lower()
+LLM_URL = os.getenv(
+    "LLM_URL", os.getenv("OLLAMA_URL", "http://192.168.0.42:11434")
+).rstrip("/")
+LLM_MODEL = os.getenv(
+    "LLM_MODEL",
+    os.getenv("OLLAMA_MODEL", "SuperQwen-AgentWorld-35B-A3B:Q4"),
+)
+LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", os.getenv("OLLAMA_TIMEOUT", "180")))
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "2048"))
+LLM_TOOL_MAX_STEPS = int(os.getenv("LLM_TOOL_MAX_STEPS", "2"))
+LLM_API_KEY = os.getenv("NIM_TOKEN") or os.getenv("NVIDIA_API_KEY") or os.getenv("LLM_API_KEY")
+LLM_FALLBACK_ENABLED = os.getenv("LLM_FALLBACK_ENABLED", "false").lower() not in {
+    "0",
+    "false",
+    "no",
+}
+LLM_FALLBACK_BACKEND = os.getenv("LLM_FALLBACK_BACKEND", "ollama").strip().lower()
+LLM_FALLBACK_URL = os.getenv("LLM_FALLBACK_URL", "http://192.168.0.42:11434").rstrip("/")
+LLM_FALLBACK_MODEL = os.getenv(
+    "LLM_FALLBACK_MODEL", "SuperQwen-AgentWorld-35B-A3B:Q4"
+)
+LLM_FALLBACK_TIMEOUT = int(os.getenv("LLM_FALLBACK_TIMEOUT", str(LLM_TIMEOUT)))
+AI_PROMPT_PATH = Path(os.getenv("AI_PROMPT_PATH", "ai_prompt.md"))
 WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "true").lower() not in {
     "0",
     "false",
     "no",
 }
-WEB_SEARCH_MAX_RESULTS = int(os.getenv("WEB_SEARCH_MAX_RESULTS", "5"))
+WEB_SEARCH_MAX_RESULTS = int(os.getenv("WEB_SEARCH_MAX_RESULTS", "3"))
+MAX_PLAYLIST_TRACKS = int(os.getenv("MAX_PLAYLIST_TRACKS", "100"))
+VOICE_EMPTY_DISCONNECT_SECONDS = float(os.getenv("VOICE_EMPTY_DISCONNECT_SECONDS", "30"))
 
 DATA_DIR = Path(os.getenv("BOT_DATA_DIR", "data"))
 MEMORY_DB_PATH = Path(os.getenv("MEMORY_DB_PATH", DATA_DIR / "memory.sqlite3"))
@@ -62,7 +93,9 @@ VOICE_MIN_SECONDS = float(os.getenv("VOICE_MIN_SECONDS", "0.65"))
 VOICE_SAMPLE_RATE = 48000
 VOICE_CHANNELS = 2
 VOICE_SAMPLE_WIDTH = 2
-VOICE_MIN_BYTES = int(VOICE_SAMPLE_RATE * VOICE_CHANNELS * VOICE_SAMPLE_WIDTH * VOICE_MIN_SECONDS)
+VOICE_MIN_BYTES = int(
+    VOICE_SAMPLE_RATE * VOICE_CHANNELS * VOICE_SAMPLE_WIDTH * VOICE_MIN_SECONDS
+)
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}
 AUDIO_SUFFIXES = {".wav", ".mp3", ".m4a", ".ogg", ".flac"}
@@ -101,13 +134,21 @@ class Track:
     title: str
     stream_url: str
     webpage_url: str | None = None
+    start_time: float = 0.0
 
 
 @dataclass
 class GuildMusicState:
     queue: deque[Track] = field(default_factory=deque)
+    history: deque[Track] = field(default_factory=lambda: deque(maxlen=25))
     current: Track | None = None
+    replay_current: Track | None = None
+    skip_votes: set[int] = field(default_factory=set)
+    skip_vote_track_key: str | None = None
+    queue_remove_votes: dict[int, set[int]] = field(default_factory=dict)
     volume: float = 1.0
+    last_text_channel_id: int | None = None
+    empty_voice_task: asyncio.Task | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -127,35 +168,838 @@ class WebSearchResult:
     snippet: str
 
 
+@dataclass
+class GameItem:
+    name: str
+    media_url: str | None = None
+    media_type: str = "image"
+
+
+@dataclass
+class QuizQuestion:
+    prompt: str
+    answers: list[str]
+    media_url: str | None = None
+    media_type: str = "image"
+    start_seconds: float | None = None
+    end_seconds: float | None = None
+
+
+@dataclass
+class ParsedWorldcup:
+    title: str
+    items: list[GameItem]
+
+
+@dataclass
+class ParsedQuiz:
+    title: str
+    questions: list[QuizQuestion]
+
+
+class GameParseError(Exception):
+    """Error message that is safe to show in Discord game commands."""
+
+
+StreamCallback = Callable[[str], Awaitable[None]]
+
+
+async def suppress_message_embeds(message: object) -> None:
+    edit = getattr(message, "edit", None)
+    if edit is None:
+        return
+    try:
+        await edit(suppress=True)
+    except (discord.HTTPException, TypeError):
+        pass
+
+
 async def send_interaction(
-    interaction: discord.Interaction, content: str, *, ephemeral: bool = False
+    interaction: discord.Interaction,
+    content: str,
+    *,
+    ephemeral: bool = False,
+    suppress_embeds: bool = False,
 ) -> None:
     if interaction.response.is_done():
-        await interaction.followup.send(content, ephemeral=ephemeral)
+        message = await interaction.followup.send(
+            content,
+            ephemeral=ephemeral,
+            wait=True,
+            suppress_embeds=suppress_embeds,
+        )
     else:
-        await interaction.response.send_message(content, ephemeral=ephemeral)
+        await interaction.response.send_message(
+            content,
+            ephemeral=ephemeral,
+            suppress_embeds=suppress_embeds,
+        )
+        message = await interaction.original_response()
+    if suppress_embeds:
+        await suppress_message_embeds(message)
 
 
-async def send_long_message(destination: discord.abc.Messageable, content: str) -> None:
+def split_long_message(content: str, limit: int = 1900) -> list[str]:
     chunks = []
     text = content.strip() or "(빈 응답)"
-    while len(text) > 1900:
-        split_at = text.rfind("\n", 0, 1900)
+    while len(text) > limit:
+        split_at = text.rfind("\n", 0, limit)
         if split_at < 500:
-            split_at = 1900
+            split_at = limit
         chunks.append(text[:split_at])
         text = text[split_at:].strip()
     chunks.append(text)
+    return chunks
 
+
+async def send_long_message(
+    destination: discord.abc.Messageable,
+    content: str,
+    *,
+    suppress_embeds: bool = False,
+) -> None:
+    chunks = split_long_message(content)
     for chunk in chunks:
-        await destination.send(chunk)
+        await destination.send(chunk, suppress_embeds=suppress_embeds)
+
+
+async def send_message(
+    destination: discord.abc.Messageable,
+    content: str,
+    *,
+    suppress_embeds: bool = False,
+) -> discord.Message | None:
+    message = await destination.send(content, suppress_embeds=suppress_embeds)
+    if suppress_embeds:
+        await suppress_message_embeds(message)
+    return message
+
+
+class DiscordStreamEditor:
+    def __init__(self, message: discord.Message, interval: float = 1.0):
+        self.message = message
+        self.interval = interval
+        self.last_edit_at = 0.0
+        self.latest = ""
+
+    async def update(self, content: str) -> None:
+        self.latest = clean_model_response(content)
+        now = time.monotonic()
+        if now - self.last_edit_at < self.interval:
+            return
+        await self._edit(self.latest)
+
+    async def finish(self, content: str | None) -> None:
+        final = clean_model_response(content or self.latest or "(빈 응답)")
+        chunks = split_long_message(final)
+        await self._edit(chunks[0])
+        for chunk in chunks[1:]:
+            await self.message.channel.send(chunk, suppress_embeds=True)
+
+    async def _edit(self, content: str) -> None:
+        visible = sanitize_discord_markdown(content)[:1900] if content else "생각 중..."
+        try:
+            await self.message.edit(content=visible, suppress=True)
+            self.last_edit_at = time.monotonic()
+        except TypeError:
+            try:
+                await self.message.edit(content=visible)
+                await suppress_message_embeds(self.message)
+                self.last_edit_at = time.monotonic()
+            except discord.HTTPException:
+                pass
+        except discord.HTTPException:
+            pass
 
 
 def clean_model_response(text: str) -> str:
+    text = strip_reasoning_output(text)
+    return sanitize_discord_markdown(text)
+
+
+def strip_reasoning_output(text: str) -> str:
+    text = re.sub(r"(?is)<think\b[^>]*>.*?</think>", "", text)
+    text = re.sub(r"(?is)<think\b[^>]*>.*$", "", text)
+    text = re.sub(r"(?is)<(?:reasoning|analysis|thought)\b[^>]*>.*?</(?:reasoning|analysis|thought)>", "", text)
+    text = re.sub(r"(?is)<(?:reasoning|analysis|thought)\b[^>]*>.*$", "", text)
+
+    harmony_final = re.search(
+        r"(?is)<\|channel\|>final\s*(?:<\|message\|>)?(.*)", text
+    )
+    if harmony_final:
+        text = harmony_final.group(1)
+    else:
+        text = re.sub(
+            r"(?is)<\|start\|>assistant<\|channel\|>(?:analysis|thought|reasoning|commentary).*?(?=<\|start\|>assistant<\|channel\|>final|$)",
+            "",
+            text,
+        )
+
+    final_label_matches = []
+    for pattern in (
+        r"(?ims)(?:^|\n)\s*(?:[-*_]{3,}\s*)?(?:#{1,6}\s*)?(?:\*\*|__)?\s*(?:final answer|최종 답변|final(?!\s+answer)|answer|최종|답변|정답)\s*[:：]\s*(?:\*\*|__)?\s*(.+)",
+        r"(?ims)(?:^|\n)\s*(?:[-*_]{3,}\s*)?(?:#{1,6}\s*)?(?:\*\*|__)?\s*(?:final answer|최종 답변|final(?!\s+answer)|answer|최종|답변|정답)\s*(?:\*\*|__)?\s*\n+(.+)",
+    ):
+        final_label_matches.extend(re.finditer(pattern, text))
+    final_label_matches.sort(key=lambda match: match.start())
+    if final_label_matches:
+        text = final_label_matches[-1].group(1)
+    else:
+        text = re.sub(
+            r"(?ims)^\s*(?:reasoning|analysis|thought process|chain of thought|thinking|추론|사고 과정)\s*[:：].*?(?=^\s*(?:final answer|final|answer|최종 답변|답변)\s*[:：]|\Z)",
+            "",
+            text,
+        )
+
     text = re.sub(r"<\|channel\>thought.*?<channel\|>", "", text, flags=re.DOTALL)
     text = re.sub(r"<\|channel\>final\n?", "", text)
+    text = re.sub(r"<\|[^>\n]+?\|>", "", text)
     text = text.replace("<channel|>", "")
     return text.strip()
+
+
+def is_reasoning_stream_in_progress(raw_text: str) -> bool:
+    final_label_patterns = (
+        r"(?ims)(?:^|\n)\s*(?:[-*_]{3,}\s*)?(?:#{1,6}\s*)?(?:\*\*|__)?\s*(?:final answer|최종 답변|final(?!\s+answer)|answer|최종|답변|정답)\s*[:：]\s*(?:\*\*|__)?",
+        r"(?ims)(?:^|\n)\s*(?:[-*_]{3,}\s*)?(?:#{1,6}\s*)?(?:\*\*|__)?\s*(?:final answer|최종 답변|final(?!\s+answer)|answer|최종|답변|정답)\s*(?:\*\*|__)?\s*\n+",
+    )
+    if any(re.search(pattern, raw_text) for pattern in final_label_patterns):
+        return False
+
+    return bool(
+        re.search(r"(?is)<think\b[^>]*>", raw_text)
+        or re.search(
+            r"(?im)^\s*(?:\*\*|__)?\s*(?:reasoning|analysis|thought process|chain of thought|thinking|추론|사고 과정)\s*(?:\*\*|__)?\s*[:：]",
+            raw_text,
+        )
+    )
+
+
+LATEX_REPLACEMENTS = {
+    r"\alpha": "α",
+    r"\beta": "β",
+    r"\gamma": "γ",
+    r"\delta": "δ",
+    r"\epsilon": "ε",
+    r"\theta": "θ",
+    r"\lambda": "λ",
+    r"\mu": "μ",
+    r"\pi": "π",
+    r"\sigma": "σ",
+    r"\omega": "ω",
+    r"\Delta": "Δ",
+    r"\Gamma": "Γ",
+    r"\Omega": "Ω",
+    r"\times": "×",
+    r"\cdot": "·",
+    r"\leq": "≤",
+    r"\geq": "≥",
+    r"\neq": "≠",
+    r"\approx": "≈",
+    r"\rightarrow": "->",
+    r"\to": "->",
+}
+
+
+def strip_latex_markdown(text: str) -> str:
+    for source, replacement in LATEX_REPLACEMENTS.items():
+        text = text.replace(source, replacement)
+
+    text = re.sub(r"\\(?:text|mathrm|mathbf|mathit)\{([^{}]*)\}", r"\1", text)
+    text = re.sub(r"(?s)\$\$(.*?)\$\$", r"\1", text)
+    text = re.sub(r"(?s)\\\[(.*?)\\\]", r"\1", text)
+    text = re.sub(r"(?s)\\\((.*?)\\\)", r"\1", text)
+    text = re.sub(r"(?s)\$([^$\n]+)\$", r"\1", text)
+    text = re.sub(r"\\([A-Za-z]+)", r"\1", text)
+    return text
+
+
+def sanitize_discord_markdown(text: str) -> str:
+    text = strip_latex_markdown(text)
+    text = re.sub(r"</?[^>\n]+>", "", text)
+    text = re.sub(r"^\s*#{1,6}\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*[-*+]\s+\[[ xX]\]\s+", "- ", text, flags=re.MULTILINE)
+
+    sanitized_lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("|") and stripped.endswith("|"):
+            cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+            if all(re.fullmatch(r":?-{3,}:?", cell) for cell in cells):
+                continue
+            sanitized_lines.append(" - ".join(cell for cell in cells if cell))
+        else:
+            sanitized_lines.append(line)
+
+    return "\n".join(sanitized_lines).strip()
+
+
+def extract_json_object(text: str) -> dict[str, object] | None:
+    text = text.strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```$", "", text)
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", text):
+        try:
+            value, _end = decoder.raw_decode(text[match.start() :])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def parse_timestamp(value: str) -> float:
+    value = value.strip().lower()
+    if not value:
+        raise ValueError("empty timestamp")
+
+    if value.isdigit():
+        return float(value)
+
+    colon_parts = value.split(":")
+    if len(colon_parts) in {2, 3} and all(part.isdigit() for part in colon_parts):
+        seconds = 0
+        for part in colon_parts:
+            seconds = seconds * 60 + int(part)
+        return float(seconds)
+
+    total = 0.0
+    matched = False
+    for amount, unit in re.findall(r"(\d+(?:\.\d+)?)(h|m|s)", value):
+        matched = True
+        number = float(amount)
+        if unit == "h":
+            total += number * 3600
+        elif unit == "m":
+            total += number * 60
+        else:
+            total += number
+
+    if matched:
+        return total
+
+    raise ValueError(f"invalid timestamp: {value}")
+
+
+def format_timestamp(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+def escape_link_label(value: str) -> str:
+    return (
+        sanitize_discord_markdown(value)
+        .replace("\\", "\\\\")
+        .replace("[", "\\[")
+        .replace("]", "\\]")
+        .replace("\n", " ")
+    )[:180]
+
+
+def format_track_link(track: Track, *, suppress_embed: bool = False) -> str:
+    title = escape_link_label(track.title)
+    if track.webpage_url:
+        url = f"<{track.webpage_url}>" if suppress_embed else track.webpage_url
+        return f"[{title}]({url})"
+    return title
+
+
+def ensure_music_query(query: str) -> str:
+    music_terms = (
+        "노래",
+        "음악",
+        "곡",
+        "ost",
+        "mv",
+        "music",
+        "song",
+        "official audio",
+        "official mv",
+        "live",
+    )
+    blocked_terms = ("주식", "투자", "급등", "차트", "수급", "상한가")
+    for term in blocked_terms:
+        query = re.sub(term, "", query, flags=re.IGNORECASE).strip()
+    query = re.sub(r"\s+", " ", query).strip(" -|")
+    if not query:
+        return ""
+    lowered = query.lower()
+    if not any(term in lowered for term in music_terms):
+        query = f"{query} 노래"
+    return query[:160]
+
+
+def normalize_answer(value: str) -> str:
+    text = unicodedata.normalize("NFKC", value).casefold()
+    return re.sub(r"[^0-9a-z가-힣ぁ-んァ-ン一-龥]+", "", text)
+
+
+def guess_media_type(url: str | None, fallback: str = "image") -> str:
+    if not url:
+        return fallback
+    path = urlparse(url).path.lower()
+    if path.endswith((".mp4", ".webm", ".mov", ".m4v")):
+        return "video"
+    if path.endswith((".mp3", ".wav", ".ogg", ".m4a", ".flac")):
+        return "audio"
+    host = urlparse(url).netloc.lower()
+    if "youtube.com" in host or "youtu.be" in host:
+        return "video"
+    return fallback
+
+
+def first_text(value: object) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return html.unescape(value.strip())
+    if isinstance(value, list):
+        for item in value:
+            found = first_text(item)
+            if found:
+                return found
+    return None
+
+
+def field_text(data: dict[str, object], names: tuple[str, ...]) -> str | None:
+    for name in names:
+        found = first_text(data.get(name))
+        if found:
+            return found
+    return None
+
+
+def field_list(data: dict[str, object], names: tuple[str, ...]) -> list[str]:
+    values: list[str] = []
+    for name in names:
+        raw = data.get(name)
+        if isinstance(raw, list):
+            values.extend(text for item in raw if (text := first_text(item)))
+        elif text := first_text(raw):
+            values.append(text)
+    return list(dict.fromkeys(value for value in values if value))
+
+
+def field_number(data: dict[str, object], names: tuple[str, ...]) -> float | None:
+    for name in names:
+        raw = data.get(name)
+        if isinstance(raw, int | float):
+            return float(raw)
+        if isinstance(raw, str):
+            try:
+                return float(raw)
+            except ValueError:
+                continue
+    return None
+
+
+def item_from_mapping(data: dict[str, object], base_url: str | None = None) -> GameItem | None:
+    name = field_text(data, ("name", "title", "label", "alt", "displayName", "answer"))
+    media_url = field_text(
+        data,
+        (
+            "media_url",
+            "mediaUrl",
+            "image_url",
+            "imageUrl",
+            "image",
+            "src",
+            "url",
+            "thumbnailUrl",
+            "thumbnail_url",
+            "videoUrl",
+            "audioUrl",
+        ),
+    )
+    if media_url and base_url:
+        media_url = urljoin(base_url, media_url)
+    if not name or not media_url:
+        return None
+    if len(name) > 120 or media_url.startswith("data:"):
+        return None
+    return GameItem(name=name, media_url=media_url, media_type=guess_media_type(media_url))
+
+
+def iter_json_items(value: object, base_url: str | None = None) -> list[GameItem]:
+    items: list[GameItem] = []
+    if isinstance(value, dict):
+        if item := item_from_mapping(value, base_url):
+            items.append(item)
+        for child in value.values():
+            items.extend(iter_json_items(child, base_url))
+    elif isinstance(value, list):
+        for child in value:
+            items.extend(iter_json_items(child, base_url))
+
+    unique: dict[tuple[str, str | None], GameItem] = {}
+    for item in items:
+        unique.setdefault((item.name, item.media_url), item)
+    return list(unique.values())
+
+
+def parse_json_worldcup(data: dict[str, object]) -> ParsedWorldcup:
+    title = field_text(data, ("title", "name")) or "이상형 월드컵"
+    raw_items = data.get("items") or data.get("candidates") or data.get("choices")
+    items = iter_json_items(raw_items if raw_items is not None else data)
+    if len(items) < 2:
+        raise GameParseError("JSON에서 월드컵 후보를 2개 이상 찾지 못했어요.")
+    return ParsedWorldcup(title=title, items=items)
+
+
+def quiz_question_from_mapping(
+    data: dict[str, object], index: int, base_url: str | None = None
+) -> QuizQuestion | None:
+    answers = field_list(data, ("answers", "answer", "aliases", "alias", "accepted"))
+    if not answers:
+        return None
+    media_url = field_text(
+        data,
+        (
+            "media_url",
+            "mediaUrl",
+            "question_image_url",
+            "questionImageUrl",
+            "crop_image_url",
+            "cropImageUrl",
+            "question_audio_url",
+            "questionAudioUrl",
+            "question_video_url",
+            "questionVideoUrl",
+            "audioUrl",
+            "videoUrl",
+            "imageUrl",
+            "url",
+        ),
+    )
+    video_id = field_text(data, ("video_id", "videoId", "youtube_id", "youtubeId"))
+    start_seconds = field_number(data, ("start_seconds", "startSeconds", "start"))
+    end_seconds = field_number(data, ("end_seconds", "endSeconds", "end"))
+    if not media_url and video_id:
+        media_url = f"https://youtu.be/{video_id}"
+        if start_seconds is not None:
+            media_url = f"{media_url}?t={max(0, int(start_seconds))}"
+    if media_url and base_url:
+        media_url = urljoin(base_url, media_url)
+    prompt = field_text(data, ("prompt", "question", "title", "text")) or f"문제 {index}"
+    media_type = field_text(data, ("media_type", "mediaType", "questionType", "type"))
+    if media_type == "music":
+        media_type = "video"
+    return QuizQuestion(
+        prompt=prompt,
+        answers=answers,
+        media_url=media_url,
+        media_type=guess_media_type(media_url, media_type or "image"),
+        start_seconds=start_seconds,
+        end_seconds=end_seconds,
+    )
+
+
+def parse_json_quiz(data: dict[str, object]) -> ParsedQuiz:
+    title = field_text(data, ("title", "name")) or "맞추기 퀴즈"
+    raw_questions = data.get("questions") or data.get("items")
+    if not isinstance(raw_questions, list):
+        raise GameParseError("JSON에서 questions 배열을 찾지 못했어요.")
+    questions = [
+        question
+        for index, raw in enumerate(raw_questions, start=1)
+        if isinstance(raw, dict)
+        if (question := quiz_question_from_mapping(raw, index))
+    ]
+    if not questions:
+        raise GameParseError("JSON에서 정답이 포함된 문제를 찾지 못했어요.")
+    return ParsedQuiz(title=title, questions=questions)
+
+
+PIKU_EXPORT_SCRIPT = r"""(() => {
+  const title =
+    document.querySelector("h1,h2,h3,h4")?.innerText?.trim() ||
+    document.title.replace(/\s*-\s*PIKU.*$/i, "").trim() ||
+    "PIKU Worldcup";
+  const nameKeys = [
+    "name", "title", "text", "label", "subject", "content", "nickname",
+    "displayName", "koName", "krName", "answer"
+  ];
+  const urlKeys = [
+    "media_url", "mediaUrl", "image_url", "imageUrl", "imgUrl", "img_url",
+    "image", "img", "src", "url", "fileUrl", "file_url", "thumbnailUrl",
+    "thumbnail_url", "thumbnail", "videoUrl", "video_url"
+  ];
+  const items = new Map();
+  const seen = new WeakSet();
+  let objectCount = 0;
+
+  const abs = (value) => {
+    if (typeof value !== "string" || !value.trim()) return null;
+    if (value.startsWith("data:") || value.startsWith("blob:")) return null;
+    try {
+      return new URL(value, location.href).href;
+    } catch {
+      return null;
+    }
+  };
+
+  const looksMedia = (value) =>
+    /\.(?:png|jpe?g|gif|webp|avif|mp4|webm|mov)(?:[?#].*)?$/i.test(value) ||
+    /(?:piku|cloudfront|cloudflare|googleusercontent|youtube|ytimg|cdn|image|img|media)/i.test(value);
+
+  const addItem = (name, url) => {
+    name = String(name || "").replace(/\s+/g, " ").trim();
+    url = abs(url);
+    if (!name || !url || name.length > 160 || !looksMedia(url)) return;
+    items.set(`${name}\n${url}`, { name, media_url: url });
+  };
+
+  const pickText = (value) => {
+    if (typeof value === "string" && value.trim() && value.length <= 160) return value.trim();
+    return null;
+  };
+
+  const inspectObject = (obj) => {
+    if (!obj || typeof obj !== "object") return;
+    let name = null;
+    let url = null;
+    for (const key of nameKeys) {
+      if (name = pickText(obj[key])) break;
+    }
+    for (const key of urlKeys) {
+      const candidate = obj[key];
+      if (typeof candidate === "string" && (url = abs(candidate))) break;
+    }
+    if (name && url) addItem(name, url);
+  };
+
+  const visit = (value, depth = 0) => {
+    if (!value || typeof value !== "object" || depth > 7 || objectCount > 30000) return;
+    if (seen.has(value)) return;
+    seen.add(value);
+    objectCount++;
+    inspectObject(value);
+    if (Array.isArray(value)) {
+      for (const child of value) visit(child, depth + 1);
+      return;
+    }
+    for (const key of Object.keys(value)) {
+      try {
+        const child = value[key];
+        if (typeof child === "object") visit(child, depth + 1);
+        else if (typeof child === "string" && looksMedia(child)) inspectObject(value);
+      } catch {}
+    }
+  };
+
+  const scanStorage = (storage) => {
+    for (let index = 0; index < storage.length; index++) {
+      const key = storage.key(index);
+      try {
+        const raw = storage.getItem(key);
+        if (!raw || raw.length > 3000000) continue;
+        if (/^\s*[\[{]/.test(raw)) visit(JSON.parse(raw), 0);
+      } catch {}
+    }
+  };
+
+  document.querySelectorAll("img,video,source").forEach((element) => {
+    const url = element.currentSrc || element.src || element.getAttribute("src") || element.getAttribute("data-src");
+    const text =
+      element.getAttribute("alt") ||
+      element.getAttribute("title") ||
+      element.closest("[title]")?.getAttribute("title") ||
+      element.closest("a,li,div")?.innerText?.split("\n").map((line) => line.trim()).find(Boolean);
+    addItem(text, url);
+  });
+
+  for (const key of ["__NEXT_DATA__", "__NUXT__", "__INITIAL_STATE__", "__APOLLO_STATE__", "__REDUX_STATE__"]) {
+    try { visit(window[key], 0); } catch {}
+  }
+  try { scanStorage(localStorage); } catch {}
+  try { scanStorage(sessionStorage); } catch {}
+
+  for (const key of Object.getOwnPropertyNames(window)) {
+    if (/^(?:webpack|__|app|vue|react|pinia|world|cup|piku)/i.test(key)) {
+      try { visit(window[key], 0); } catch {}
+    }
+  }
+
+  const output = { title, items: Array.from(items.values()) };
+  const json = JSON.stringify(output, null, 2);
+  console.log(`PIKU export: ${output.items.length} items`, output);
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(json).catch(() => {});
+  }
+  const blob = new Blob([json], { type: "application/json" });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = "piku-worldcup.json";
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+  alert(`${output.items.length}개 후보를 추출했어요. piku-worldcup.json을 /worldcup data에 업로드해 주세요.`);
+})();"""
+
+
+async def read_json_attachment(attachment: discord.Attachment) -> dict[str, object]:
+    if Path(attachment.filename).suffix.lower() not in {".json", ".txt"}:
+        raise GameParseError("fallback 데이터는 JSON 또는 TXT 파일로 업로드해 주세요.")
+    raw = await attachment.read()
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise GameParseError(f"JSON 파일을 읽지 못했어요: {exc}") from exc
+    if not isinstance(data, dict):
+        raise GameParseError("JSON 최상위 값은 객체여야 해요.")
+    return data
+
+
+async def fetch_text(url: str, *, headers: dict[str, str] | None = None) -> str:
+    request_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/126 Safari/537.36"
+        ),
+        **(headers or {}),
+    }
+    timeout = aiohttp.ClientTimeout(total=20)
+    async with aiohttp.ClientSession(timeout=timeout, headers=request_headers) as session:
+        async with session.get(url) as response:
+            text = await response.text()
+            if response.status >= 400:
+                raise GameParseError(f"사이트 응답이 실패했어요. HTTP {response.status}")
+            return text
+
+
+def html_title(page: str, fallback: str) -> str:
+    patterns = (
+        r'<meta\s+property=["\']og:title["\']\s+content=["\']([^"\']+)["\']',
+        r"<title[^>]*>(.*?)</title>",
+        r"<h1[^>]*>(.*?)</h1>",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, page, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            title = re.sub(r"<[^>]+>", "", html.unescape(match.group(1))).strip()
+            if title:
+                return title
+    return fallback
+
+
+async def parse_worldcup_from_url(url: str) -> ParsedWorldcup:
+    try:
+        page = await fetch_text(url)
+    except GameParseError as exc:
+        if "HTTP 403" in str(exc):
+            raise GameParseError(
+                "PIKU가 현재 봇의 직접 접근을 막고 있어요. JSON fallback 파일을 같이 업로드해 주세요."
+            ) from exc
+        raise
+    if "cf_chl" in page or "Just a moment" in page:
+        raise GameParseError(
+            "PIKU가 현재 봇의 직접 접근을 막고 있어요. JSON fallback 파일을 같이 업로드해 주세요."
+        )
+
+    title = html_title(page, "이상형 월드컵")
+    items: list[GameItem] = []
+
+    for match in re.finditer(
+        r'<script[^>]+type=["\']application/json["\'][^>]*>(.*?)</script>',
+        page,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        try:
+            data = json.loads(html.unescape(match.group(1)))
+        except json.JSONDecodeError:
+            continue
+        items.extend(iter_json_items(data, url))
+
+    for match in re.finditer(r"<img\b([^>]+)>", page, flags=re.IGNORECASE | re.DOTALL):
+        attrs = dict(
+            (name.lower(), html.unescape(value))
+            for name, value in re.findall(
+                r'([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*["\']([^"\']+)["\']',
+                match.group(1),
+            )
+        )
+        src = attrs.get("src") or attrs.get("data-src")
+        alt = attrs.get("alt") or attrs.get("title")
+        if not src or not alt:
+            continue
+        src = urljoin(url, src)
+        if any(skip in src.lower() for skip in ("logo", "icon", "sprite")):
+            continue
+        items.append(GameItem(name=alt.strip(), media_url=src, media_type=guess_media_type(src)))
+
+    unique: dict[tuple[str, str | None], GameItem] = {}
+    for item in items:
+        unique.setdefault((item.name, item.media_url), item)
+    items = list(unique.values())
+    if len(items) < 2:
+        raise GameParseError(
+            "PIKU 페이지에서 후보 목록을 찾지 못했어요. 해당 사이트가 데이터를 숨기면 JSON fallback이 필요해요."
+        )
+    return ParsedWorldcup(title=title, items=items)
+
+
+def machugi_quiz_id(url: str) -> str:
+    path_parts = [part for part in urlparse(url).path.split("/") if part]
+    if "quiz" not in path_parts:
+        raise GameParseError("machugi.io 퀴즈 URL은 /quiz/{id} 형식이어야 해요.")
+    index = path_parts.index("quiz")
+    try:
+        return path_parts[index + 1]
+    except IndexError as exc:
+        raise GameParseError("machugi.io 퀴즈 ID를 찾지 못했어요.") from exc
+
+
+async def parse_machugi_from_url(url: str, count: int) -> ParsedQuiz:
+    quiz_id = machugi_quiz_id(url)
+    headers = {"Origin": "https://machugi.io", "Referer": f"https://machugi.io/quiz/{quiz_id}"}
+    page = await fetch_text(url, headers=headers)
+    next_match = re.search(
+        r'<script\s+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
+        page,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not next_match:
+        raise GameParseError("machugi 페이지에서 퀴즈 메타데이터를 찾지 못했어요.")
+    try:
+        next_data = json.loads(html.unescape(next_match.group(1)))
+        quiz_type = next_data["props"]["pageProps"]["quizType"]
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise GameParseError("machugi 퀴즈 메타데이터 형식이 예상과 달라요.") from exc
+
+    title = field_text(quiz_type, ("title", "name")) or "맞추기 퀴즈"
+    update_date = quiz_type.get("updatedDate") or quiz_type.get("updateDate")
+    question_ids = quiz_type.get("questionIds")
+    max_count = len(question_ids) if isinstance(question_ids, list) else count
+    request_count = max(1, min(count, max_count or count, 50))
+
+    timeout = aiohttp.ClientTimeout(total=20)
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        async with session.post(
+            f"https://quiz-question-api.machugi.io/api/play/{quiz_id}",
+            json={"n": request_count, "excludeIds": [], "updateDate": update_date},
+        ) as response:
+            payload = await response.text()
+            if response.status >= 400:
+                raise GameParseError(f"machugi 문제 API 호출이 실패했어요. HTTP {response.status}")
+            try:
+                data = json.loads(payload)
+            except json.JSONDecodeError as exc:
+                raise GameParseError("machugi 문제 API 응답을 JSON으로 읽지 못했어요.") from exc
+
+    raw_questions = data.get("questions") if isinstance(data, dict) else None
+    if not isinstance(raw_questions, list):
+        raise GameParseError("machugi 문제 API에서 questions 배열을 찾지 못했어요.")
+    questions = [
+        question
+        for index, raw in enumerate(raw_questions, start=1)
+        if isinstance(raw, dict)
+        if (question := quiz_question_from_mapping(raw, index, "https://machugi.io"))
+    ]
+    if not questions:
+        raise GameParseError("machugi 문제에서 정답 데이터를 찾지 못했어요.")
+    return ParsedQuiz(title=title, questions=questions)
 
 
 class MemoryStore:
@@ -200,6 +1044,12 @@ class MemoryStore:
                 voice_name TEXT,
                 voice_style_path TEXT,
                 lang TEXT,
+                updated_at REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS guild_settings (
+                guild_id INTEGER PRIMARY KEY,
+                llm_enabled INTEGER NOT NULL DEFAULT 1,
                 updated_at REAL NOT NULL
             );
             """
@@ -256,7 +1106,9 @@ class MemoryStore:
             ).fetchone()
             return row["summary"] if row else ""
 
-    async def fetch_recent_user(self, guild_id: int, user_id: int, limit: int) -> list[sqlite3.Row]:
+    async def fetch_recent_user(
+        self, guild_id: int, user_id: int, limit: int
+    ) -> list[sqlite3.Row]:
         async with self.lock:
             rows = self.connection.execute(
                 """
@@ -279,6 +1131,40 @@ class MemoryStore:
                 LIMIT ?
                 """,
                 (guild_id, limit),
+            ).fetchall()
+            return list(reversed(rows))
+
+    async def fetch_messages(
+        self,
+        guild_id: int,
+        *,
+        user_id: int | None = None,
+        channel_id: int | None = None,
+        query: str | None = None,
+        limit: int = 20,
+    ) -> list[sqlite3.Row]:
+        conditions = ["guild_id = ?"]
+        params: list[object] = [guild_id]
+        if user_id is not None:
+            conditions.append("user_id = ?")
+            params.append(user_id)
+        if channel_id is not None:
+            conditions.append("channel_id = ?")
+            params.append(channel_id)
+        if query:
+            conditions.append("content LIKE ?")
+            params.append(f"%{query[:120]}%")
+        params.append(max(1, min(limit, 100)))
+
+        async with self.lock:
+            rows = self.connection.execute(
+                f"""
+                SELECT * FROM messages
+                WHERE {' AND '.join(conditions)}
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                params,
             ).fetchall()
             return list(reversed(rows))
 
@@ -368,8 +1254,12 @@ class MemoryStore:
 
     async def reset_guild(self, guild_id: int) -> None:
         async with self.lock:
-            self.connection.execute("DELETE FROM guild_memory WHERE guild_id = ?", (guild_id,))
-            self.connection.execute("DELETE FROM messages WHERE guild_id = ?", (guild_id,))
+            self.connection.execute(
+                "DELETE FROM guild_memory WHERE guild_id = ?", (guild_id,)
+            )
+            self.connection.execute(
+                "DELETE FROM messages WHERE guild_id = ?", (guild_id,)
+            )
             self.connection.commit()
 
     async def get_voice_settings(self, guild_id: int) -> dict[str, str | None]:
@@ -401,7 +1291,9 @@ class MemoryStore:
         current = await self.get_voice_settings(guild_id)
         voice_name = voice_name if voice_name is not None else current["voice_name"]
         voice_style_path = (
-            voice_style_path if voice_style_path is not None else current["voice_style_path"]
+            voice_style_path
+            if voice_style_path is not None
+            else current["voice_style_path"]
         )
         lang = lang if lang is not None else current["lang"]
 
@@ -420,18 +1312,58 @@ class MemoryStore:
             )
             self.connection.commit()
 
+    async def is_llm_enabled(self, guild_id: int) -> bool:
+        async with self.lock:
+            row = self.connection.execute(
+                "SELECT llm_enabled FROM guild_settings WHERE guild_id = ?",
+                (guild_id,),
+            ).fetchone()
+            return True if row is None else bool(row["llm_enabled"])
 
-class OllamaClient:
-    def __init__(self, base_url: str, model: str, timeout: int):
+    async def set_llm_enabled(self, guild_id: int, enabled: bool) -> None:
+        async with self.lock:
+            self.connection.execute(
+                """
+                INSERT INTO guild_settings (guild_id, llm_enabled, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET
+                    llm_enabled = excluded.llm_enabled,
+                    updated_at = excluded.updated_at
+                """,
+                (guild_id, 1 if enabled else 0, time.time()),
+            )
+            self.connection.commit()
+
+
+class LLMClient:
+    def __init__(
+        self,
+        backend: str,
+        base_url: str,
+        model: str,
+        timeout: int,
+        *,
+        api_key: str | None = None,
+        max_tokens: int = 2048,
+    ):
+        self.backend = backend
         self.base_url = base_url
         self.model = model
         self.timeout = timeout
+        self.api_key = api_key
+        self.max_tokens = max_tokens
 
-    async def generate(self, prompt: str, *, media_paths: list[Path] | None = None) -> str:
+    def build_ollama_payload(
+        self,
+        prompt: str,
+        *,
+        media_paths: list[Path] | None = None,
+        stream: bool = False,
+    ) -> dict[str, object]:
         payload: dict[str, object] = {
             "model": self.model,
             "prompt": prompt,
-            "stream": False,
+            "stream": stream,
             "options": {
                 "temperature": 1.0,
                 "top_p": 0.95,
@@ -440,13 +1372,57 @@ class OllamaClient:
         }
         if media_paths:
             payload["images"] = [
-                base64.b64encode(path.read_bytes()).decode("ascii") for path in media_paths
+                base64.b64encode(path.read_bytes()).decode("ascii")
+                for path in media_paths
             ]
+        return payload
 
+    def build_openai_payload(
+        self, prompt: str, *, stream: bool = False
+    ) -> dict[str, object]:
+        return {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": stream,
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "max_tokens": self.max_tokens,
+        }
+
+    @property
+    def is_ollama(self) -> bool:
+        return self.backend == "ollama"
+
+    def chat_completions_url(self) -> str:
+        if self.base_url.endswith("/chat/completions"):
+            return self.base_url
+        return f"{self.base_url.rstrip('/')}/chat/completions"
+
+    def headers(self) -> dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if not self.is_ollama and self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
+
+    async def generate(
+        self, prompt: str, *, media_paths: list[Path] | None = None
+    ) -> str:
+        if self.is_ollama:
+            return await self.generate_ollama(prompt, media_paths=media_paths)
+        return await self.generate_openai_compat(prompt)
+
+    async def generate_ollama(
+        self, prompt: str, *, media_paths: list[Path] | None = None
+    ) -> str:
+        payload = self.build_ollama_payload(
+            prompt, media_paths=media_paths, stream=False
+        )
         timeout = aiohttp.ClientTimeout(total=self.timeout)
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(f"{self.base_url}/api/generate", json=payload) as response:
+                async with session.post(
+                    f"{self.base_url}/api/generate", json=payload
+                ) as response:
                     if response.status >= 400:
                         body = await response.text()
                         raise AIError(f"Ollama 오류 {response.status}: {body[:300]}")
@@ -460,6 +1436,196 @@ class OllamaClient:
         if not isinstance(answer, str) or not answer.strip():
             raise AIError("Ollama가 빈 응답을 반환했어요.")
         return clean_model_response(answer)
+
+    async def generate_openai_compat(self, prompt: str) -> str:
+        if self.backend == "nim" and not self.api_key:
+            raise AIError("NIM_TOKEN이 설정되어 있지 않아 NVIDIA NIM을 호출할 수 없어요.")
+        payload = self.build_openai_payload(prompt, stream=False)
+        timeout = aiohttp.ClientTimeout(total=self.timeout)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    self.chat_completions_url(),
+                    json=payload,
+                    headers=self.headers(),
+                ) as response:
+                    if response.status >= 400:
+                        body = await response.text()
+                        raise AIError(f"LLM 오류 {response.status}: {body[:300]}")
+                    data = await response.json()
+        except asyncio.TimeoutError as exc:
+            raise AIError("LLM 응답 시간이 초과됐어요.") from exc
+        except aiohttp.ClientError as exc:
+            raise AIError(f"LLM 서버에 연결하지 못했어요: {exc}") from exc
+
+        try:
+            answer = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise AIError("LLM 응답 형식을 읽지 못했어요.") from exc
+        if not isinstance(answer, str) or not answer.strip():
+            raise AIError("LLM이 빈 응답을 반환했어요.")
+        return clean_model_response(answer)
+
+    async def generate_stream(
+        self,
+        prompt: str,
+        *,
+        media_paths: list[Path] | None = None,
+        on_update: StreamCallback | None = None,
+    ) -> str:
+        if self.is_ollama:
+            return await self.generate_ollama_stream(
+                prompt, media_paths=media_paths, on_update=on_update
+            )
+        return await self.generate_openai_compat_stream(prompt, on_update=on_update)
+
+    async def generate_ollama_stream(
+        self,
+        prompt: str,
+        *,
+        media_paths: list[Path] | None = None,
+        on_update: StreamCallback | None = None,
+    ) -> str:
+        payload = self.build_ollama_payload(prompt, media_paths=media_paths, stream=True)
+        timeout = aiohttp.ClientTimeout(total=self.timeout)
+        chunks: list[str] = []
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    f"{self.base_url}/api/generate", json=payload
+                ) as response:
+                    if response.status >= 400:
+                        body = await response.text()
+                        raise AIError(f"Ollama 오류 {response.status}: {body[:300]}")
+
+                    while True:
+                        line = await response.content.readline()
+                        if not line:
+                            break
+                        try:
+                            data = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+
+                        token = data.get("response", "")
+                        if isinstance(token, str) and token:
+                            chunks.append(token)
+                            if on_update:
+                                raw_text = "".join(chunks)
+                                if not is_reasoning_stream_in_progress(raw_text):
+                                    cleaned = clean_model_response(raw_text)
+                                    if cleaned:
+                                        await on_update(cleaned)
+
+                        if data.get("done"):
+                            break
+        except asyncio.TimeoutError as exc:
+            raise AIError("Ollama 응답 시간이 초과됐어요.") from exc
+        except aiohttp.ClientError as exc:
+            raise AIError(f"Ollama 서버에 연결하지 못했어요: {exc}") from exc
+
+        answer = clean_model_response("".join(chunks))
+        if not answer:
+            raise AIError("Ollama가 빈 응답을 반환했어요.")
+        return answer
+
+    async def generate_openai_compat_stream(
+        self, prompt: str, *, on_update: StreamCallback | None = None
+    ) -> str:
+        if self.backend == "nim" and not self.api_key:
+            raise AIError("NIM_TOKEN이 설정되어 있지 않아 NVIDIA NIM을 호출할 수 없어요.")
+        payload = self.build_openai_payload(prompt, stream=True)
+        timeout = aiohttp.ClientTimeout(total=self.timeout)
+        chunks: list[str] = []
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    self.chat_completions_url(),
+                    json=payload,
+                    headers=self.headers(),
+                ) as response:
+                    if response.status >= 400:
+                        body = await response.text()
+                        raise AIError(f"LLM 오류 {response.status}: {body[:300]}")
+
+                    async for raw_line in response.content:
+                        line = raw_line.decode(errors="ignore").strip()
+                        if not line or not line.startswith("data:"):
+                            continue
+                        payload_text = line.removeprefix("data:").strip()
+                        if payload_text == "[DONE]":
+                            break
+                        try:
+                            data = json.loads(payload_text)
+                        except json.JSONDecodeError:
+                            continue
+                        try:
+                            token = data["choices"][0]["delta"].get("content", "")
+                        except (KeyError, IndexError, TypeError):
+                            token = ""
+                        if token:
+                            chunks.append(token)
+                            if on_update:
+                                raw_text = "".join(chunks)
+                                if not is_reasoning_stream_in_progress(raw_text):
+                                    cleaned = clean_model_response(raw_text)
+                                    if cleaned:
+                                        await on_update(cleaned)
+        except asyncio.TimeoutError as exc:
+            raise AIError("LLM 응답 시간이 초과됐어요.") from exc
+        except aiohttp.ClientError as exc:
+            raise AIError(f"LLM 서버에 연결하지 못했어요: {exc}") from exc
+
+        answer = clean_model_response("".join(chunks))
+        if not answer:
+            raise AIError("LLM이 빈 응답을 반환했어요.")
+        return answer
+
+
+class FallbackLLMClient:
+    def __init__(self, primary: LLMClient, fallback: LLMClient | None):
+        self.primary = primary
+        self.fallback = fallback
+
+    async def generate(
+        self, prompt: str, *, media_paths: list[Path] | None = None
+    ) -> str:
+        try:
+            return await self.primary.generate(prompt, media_paths=media_paths)
+        except AIError as primary_error:
+            if self.fallback is None:
+                raise
+            try:
+                return await self.fallback.generate(prompt, media_paths=media_paths)
+            except AIError as fallback_error:
+                raise AIError(
+                    f"주 LLM과 fallback LLM이 모두 실패했어요. 주 오류: {primary_error} / fallback 오류: {fallback_error}"
+                ) from fallback_error
+
+    async def generate_stream(
+        self,
+        prompt: str,
+        *,
+        media_paths: list[Path] | None = None,
+        on_update: StreamCallback | None = None,
+    ) -> str:
+        try:
+            return await self.primary.generate_stream(
+                prompt, media_paths=media_paths, on_update=on_update
+            )
+        except AIError as primary_error:
+            if self.fallback is None:
+                raise
+            if on_update:
+                await on_update("주 LLM이 잠깐 불안정해서 로컬 모델로 이어갈게요.")
+            try:
+                return await self.fallback.generate_stream(
+                    prompt, media_paths=media_paths, on_update=on_update
+                )
+            except AIError as fallback_error:
+                raise AIError(
+                    f"주 LLM과 fallback LLM이 모두 실패했어요. 주 오류: {primary_error} / fallback 오류: {fallback_error}"
+                ) from fallback_error
 
 
 class WebSearchClient:
@@ -482,17 +1648,327 @@ class WebSearchClient:
                 url = str(result.get("href") or result.get("url") or "").strip()
                 snippet = str(result.get("body") or "").strip()
                 if title and url:
-                    results.append(WebSearchResult(title=title, url=url, snippet=snippet))
+                    results.append(
+                        WebSearchResult(title=title, url=url, snippet=snippet)
+                    )
         return results
+
+
+@dataclass
+class ToolExecutionContext:
+    bot: commands.Bot
+    store: MemoryStore
+    client: LLMClient
+    guild: discord.Guild
+    channel_id: int
+    user: discord.abc.User
+    kind: str
+    is_admin: bool
+    messageable: discord.abc.Messageable | None = None
+
+
+@dataclass
+class ToolResult:
+    content: str
+    final: bool = False
+
+
+class AITool:
+    name: str = ""
+    description: str = ""
+    schema: str = "{}"
+    admin_only: bool = False
+
+    async def run(
+        self, context: ToolExecutionContext, arguments: dict[str, object]
+    ) -> ToolResult:
+        raise NotImplementedError
+
+    def instruction(self) -> str:
+        admin_note = " Admin only." if self.admin_only else ""
+        return f"- {self.name}: {self.description}{admin_note} JSON: {self.schema}"
+
+
+class ToolRegistry:
+    def __init__(self):
+        self.tools: dict[str, AITool] = {}
+
+    def register(self, tool: AITool) -> None:
+        self.tools[tool.name] = tool
+
+    def get(self, name: str) -> AITool | None:
+        return self.tools.get(name)
+
+    def instructions(self) -> str:
+        return "\n".join(tool.instruction() for tool in self.tools.values())
+
+    def names(self) -> set[str]:
+        return set(self.tools)
+
+
+class AskUserTool(AITool):
+    name = "ask_user"
+    description = "Ask a short follow-up question."
+    schema = '{"tool":"ask_user","question":"질문"}'
+
+    async def run(
+        self, context: ToolExecutionContext, arguments: dict[str, object]
+    ) -> ToolResult:
+        question = str(arguments.get("question") or "").strip()
+        return ToolResult(question or "조금 더 구체적으로 알려주세요.", final=True)
+
+
+class WebSearchTool(AITool):
+    name = "web_search"
+    description = "Search current external facts."
+    schema = '{"tool":"web_search","query":"검색어"}'
+
+    def __init__(self, web_search: WebSearchClient):
+        self.web_search = web_search
+
+    async def run(
+        self, context: ToolExecutionContext, arguments: dict[str, object]
+    ) -> ToolResult:
+        query = str(arguments.get("query") or "").strip()[:300]
+        if not query:
+            return ToolResult("검색어가 비어 있어 웹검색을 실행하지 못했습니다.")
+        results = await self.web_search.search(query)
+        if not results:
+            return ToolResult(
+                f"검색 query: {query}\n검색 결과를 가져오지 못했습니다. 이 한계를 답변에 명확히 말하세요."
+            )
+        formatted = "\n".join(
+            f"[{index}] {result.title}\nURL: {result.url}\n요약: {result.snippet[:700]}"
+            for index, result in enumerate(results, start=1)
+        )
+        return ToolResult(
+            "아래 WEB_RESULTS에 있는 URL만 사용할 수 있습니다. 검색 결과에 없는 URL, 제목, 출처는 만들지 마세요.\n"
+            f"검색 query: {query}\n{formatted}"
+        )
+
+
+class DiscordContextTool(AITool):
+    name = "discord_context"
+    description = "Fetch server, member, Discord history, DB history, or memory context."
+    schema = '{"tool":"discord_context","action":"server_overview|member_info|recent_messages|db_messages|user_memory|server_memory","user_id":"optional","channel_id":"optional","query":"optional","limit":20}'
+
+    async def run(
+        self, context: ToolExecutionContext, arguments: dict[str, object]
+    ) -> ToolResult:
+        action = str(arguments.get("action") or "server_overview").strip().lower()
+        if action == "server_overview":
+            return ToolResult(self.server_overview(context.guild))
+        if action == "member_info":
+            return ToolResult(self.member_info(context, arguments))
+        if action == "recent_messages":
+            return await self.recent_messages(context, arguments)
+        if action == "db_messages":
+            return await self.db_messages(context, arguments)
+        if action == "user_memory":
+            return await self.user_memory(context, arguments)
+        if action == "server_memory":
+            summary = await context.store.fetch_guild_summary(context.guild.id)
+            return ToolResult(summary or "서버 공유 memory가 아직 없습니다.")
+        return ToolResult(f"알 수 없는 discord_context action입니다: {action}")
+
+    def server_overview(self, guild: discord.Guild) -> str:
+        text_channels = [channel.name for channel in guild.text_channels[:20]]
+        voice_channels = [channel.name for channel in guild.voice_channels[:20]]
+        roles = [role.name for role in guild.roles if role.name != "@everyone"][:20]
+        humans = sum(1 for member in guild.members if not member.bot)
+        bots = sum(1 for member in guild.members if member.bot)
+        return (
+            f"서버: {guild.name} ({guild.id})\n"
+            f"멤버: 사람 {humans}명, 봇 {bots}개\n"
+            f"텍스트 채널: {', '.join(text_channels) or '없음'}\n"
+            f"음성 채널: {', '.join(voice_channels) or '없음'}\n"
+            f"역할 일부: {', '.join(roles) or '없음'}"
+        )
+
+    def resolve_member(
+        self, guild: discord.Guild, value: object
+    ) -> discord.Member | None:
+        raw = str(value or "").strip()
+        match = re.search(r"\d{15,25}", raw)
+        if match:
+            member = guild.get_member(int(match.group(0)))
+            if member:
+                return member
+        lowered = raw.lower()
+        for member in guild.members:
+            if lowered in {
+                member.name.lower(),
+                member.display_name.lower(),
+                str(member.id),
+            }:
+                return member
+        return None
+
+    def member_info(
+        self, context: ToolExecutionContext, arguments: dict[str, object]
+    ) -> str:
+        member = self.resolve_member(context.guild, arguments.get("user_id"))
+        if member is None:
+            member = context.user if isinstance(context.user, discord.Member) else None
+        if member is None:
+            return "유저를 찾지 못했습니다."
+        role_names = [role.name for role in member.roles if role.name != "@everyone"]
+        voice = getattr(member, "voice", None)
+        voice_name = voice.channel.name if voice and voice.channel else "없음"
+        return (
+            f"유저: {member.display_name} ({member.id})\n"
+            f"계정명: {member.name}\n"
+            f"봇 여부: {member.bot}\n"
+            f"서버 참가일: {member.joined_at}\n"
+            f"음성 채널: {voice_name}\n"
+            f"역할: {', '.join(role_names[:20]) or '없음'}"
+        )
+
+    async def recent_messages(
+        self, context: ToolExecutionContext, arguments: dict[str, object]
+    ) -> ToolResult:
+        channel_id = self.parse_int(arguments.get("channel_id")) or context.channel_id
+        channel = context.guild.get_channel(channel_id)
+        if channel is None or not hasattr(channel, "history"):
+            return ToolResult("채널을 찾지 못했거나 메시지 기록을 읽을 수 없습니다.")
+        limit = self.safe_limit(arguments.get("limit"), context.is_admin)
+        rows = []
+        async for message in channel.history(limit=limit):
+            if message.author.bot:
+                continue
+            rows.append(f"- {message.author.display_name}: {message.content[:700]}")
+        rows.reverse()
+        return ToolResult("\n".join(rows) or "읽을 수 있는 최근 메시지가 없습니다.")
+
+    async def db_messages(
+        self, context: ToolExecutionContext, arguments: dict[str, object]
+    ) -> ToolResult:
+        user_id = self.parse_int(arguments.get("user_id"))
+        channel_id = self.parse_int(arguments.get("channel_id"))
+        query = str(arguments.get("query") or "").strip() or None
+        limit = self.safe_limit(arguments.get("limit"), context.is_admin)
+        rows = await context.store.fetch_messages(
+            context.guild.id,
+            user_id=user_id,
+            channel_id=channel_id,
+            query=query,
+            limit=limit,
+        )
+        lines = [
+            f"- {row['author_name']}({row['kind']}/{row['role']}): {row['content']}"
+            for row in rows
+        ]
+        return ToolResult("\n".join(lines) or "DB에서 조건에 맞는 대화를 찾지 못했습니다.")
+
+    async def user_memory(
+        self, context: ToolExecutionContext, arguments: dict[str, object]
+    ) -> ToolResult:
+        requested_id = self.parse_int(arguments.get("user_id")) or context.user.id
+        if requested_id != context.user.id and not context.is_admin:
+            return ToolResult("다른 사용자의 장기 memory는 서버 관리자만 조회할 수 있습니다.")
+        summary = await context.store.fetch_user_summary(context.guild.id, requested_id)
+        return ToolResult(summary or "해당 유저의 장기 memory가 아직 없습니다.")
+
+    def parse_int(self, value: object) -> int | None:
+        if value is None:
+            return None
+        match = re.search(r"\d{1,25}", str(value))
+        return int(match.group(0)) if match else None
+
+    def safe_limit(self, value: object, is_admin: bool) -> int:
+        try:
+            limit = int(value)
+        except (TypeError, ValueError):
+            limit = 20
+        return max(1, min(limit, 50 if is_admin else 20))
+
+
+class MusicQueueTool(AITool):
+    name = "music_queue"
+    description = "Read the current music queue."
+    schema = '{"tool":"music_queue"}'
+
+    async def run(
+        self, context: ToolExecutionContext, arguments: dict[str, object]
+    ) -> ToolResult:
+        music_cog = context.bot.get_cog("Music")
+        if not isinstance(music_cog, Music):
+            return ToolResult("음악 기능을 찾지 못했습니다.")
+        state = music_cog.state_for(context.guild)
+        lines = []
+        if state.current:
+            lines.append(f"재생 중: {format_track_link(state.current, suppress_embed=True)}")
+        lines.extend(
+            f"{index}. {format_track_link(track, suppress_embed=True)}"
+            for index, track in enumerate(state.queue, start=1)
+        )
+        return ToolResult("\n".join(lines) or "대기열이 비어 있습니다.")
+
+
+class MusicRecommendTool(AITool):
+    name = "music_recommend"
+    description = "Search YouTube music and add results to the queue. Use only for clear music requests."
+    schema = '{"tool":"music_recommend","query":"장르/작품/분위기/아티스트 등 YouTube 검색 의도","count":3}'
+
+    async def run(
+        self, context: ToolExecutionContext, arguments: dict[str, object]
+    ) -> ToolResult:
+        if not isinstance(context.user, discord.Member):
+            return ToolResult("음악 추천은 서버 멤버에게만 사용할 수 있습니다.", final=True)
+        voice_state = getattr(context.user, "voice", None)
+        if voice_state is None or voice_state.channel is None:
+            return ToolResult("추천곡을 큐에 넣으려면 먼저 음성 채널에 들어가 주세요.", final=True)
+        music_cog = context.bot.get_cog("Music")
+        if not isinstance(music_cog, Music):
+            return ToolResult("음악 기능을 찾지 못했습니다.", final=True)
+
+        query = str(arguments.get("query") or arguments.get("description") or "").strip()
+        if not query:
+            return ToolResult("음악 추천 기준이 부족합니다. 장르, 주제, 분위기, 작품명, 곡 수 등을 물어보세요.")
+        count = self.normalize_count(arguments.get("count"))
+        search_query = ensure_music_query(query)
+        if not search_query:
+            return ToolResult("추천할 검색어를 만들지 못했습니다. 사용자에게 취향을 더 구체적으로 물어보세요.")
+        try:
+            tracks = await music_cog.enqueue_recommendation_query(
+                context.guild,
+                context.user,
+                context.messageable or context.guild.system_channel or context.user,
+                search_query,
+                count,
+            )
+        except MusicError as exc:
+            return ToolResult(str(exc), final=True)
+        lines = [
+            f"{index}. {format_track_link(track, suppress_embed=True)}"
+            for index, track in enumerate(tracks, start=1)
+        ]
+        return ToolResult(
+            f"추천곡 {len(tracks)}개를 YouTube에서 찾아 큐에 추가했어요:\n"
+            + "\n".join(lines),
+            final=True,
+        )
+
+    def normalize_count(self, value: object) -> int:
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            count = 5
+        return max(1, min(count, 10))
 
 
 class AIConversationService:
     def __init__(
-        self, store: MemoryStore, client: OllamaClient, web_search: WebSearchClient
+        self,
+        bot: commands.Bot,
+        store: MemoryStore,
+        client: LLMClient,
+        tool_registry: ToolRegistry,
     ):
+        self.bot = bot
         self.store = store
         self.client = client
-        self.web_search = web_search
+        self.tool_registry = tool_registry
         self.compress_lock = asyncio.Lock()
 
     async def answer(
@@ -505,26 +1981,82 @@ class AIConversationService:
         kind: str,
         media_path: Path | None = None,
         always_reply: bool = True,
+        is_admin: bool = False,
+        messageable: discord.abc.Messageable | None = None,
+        stream_callback: StreamCallback | None = None,
     ) -> str | None:
         await self.store.add_message(
             guild.id, channel_id, user.id, user.display_name, "user", kind, content
         )
-        prompt = await self.build_prompt(
-            guild.id, user, content, kind, always_reply, media_path=media_path
+        tool_context = ToolExecutionContext(
+            bot=self.bot,
+            store=self.store,
+            client=self.client,
+            guild=guild,
+            channel_id=channel_id,
+            user=user,
+            kind=kind,
+            is_admin=is_admin,
+            messageable=messageable,
         )
-        answer = await self.client.generate(
-            prompt, media_paths=[media_path] if media_path is not None else None
-        )
-        search_query = self.extract_search_query(answer)
-        if search_query:
-            search_results = await self.web_search.search(search_query)
-            if not search_results:
-                answer = "웹검색을 시도했지만 검색 결과를 가져오지 못했어요."
-            else:
-                answer = await self.client.generate(
-                    self.build_search_answer_prompt(prompt, search_query, search_results),
-                    media_paths=[media_path] if media_path is not None else None,
+        tool_outputs: list[str] = []
+        answer = ""
+
+        for _step in range(max(1, LLM_TOOL_MAX_STEPS)):
+            prompt = await self.build_prompt(
+                guild.id,
+                user,
+                content,
+                kind,
+                always_reply,
+                media_path=media_path,
+                is_admin=is_admin,
+                tool_outputs=tool_outputs,
+            )
+
+            async def first_pass_update(text: str) -> None:
+                if not stream_callback:
+                    return
+                stripped = text.strip().upper()
+                if not stripped:
+                    return
+                if stripped.startswith("{") or stripped.startswith("```JSON"):
+                    return
+                tool_call = extract_json_object(text)
+                if tool_call and str(tool_call.get("tool", "")).lower() in self.tool_registry.names():
+                    return
+                if "WEB_SEARCH".startswith(stripped) or stripped.startswith("WEB_SEARCH"):
+                    return
+                await stream_callback(text)
+
+            media_paths = [media_path] if media_path is not None else None
+            if stream_callback:
+                answer = await self.client.generate_stream(
+                    prompt, media_paths=media_paths, on_update=first_pass_update
                 )
+            else:
+                answer = await self.client.generate(prompt, media_paths=media_paths)
+
+            tool_call = self.extract_tool_call(answer)
+            legacy_search_query = self.extract_search_query(answer)
+            if legacy_search_query and not tool_call:
+                tool_call = {"tool": "web_search", "query": legacy_search_query}
+            if not tool_call:
+                break
+
+            result = await self.run_tool(tool_context, tool_call)
+            if result.final:
+                answer = result.content
+                if stream_callback:
+                    await stream_callback(answer)
+                break
+            tool_outputs.append(
+                f"[TOOL_RESULT:{tool_call.get('tool')}]\n{result.content[:3500]}"
+            )
+            if stream_callback:
+                await stream_callback(f"{tool_call.get('tool')} 도구 실행 완료")
+        else:
+            answer = "도구 호출이 반복되어 응답을 중단했어요. 질문을 조금 더 구체적으로 다시 보내주세요."
 
         if answer.strip().upper() == "NO_REPLY":
             return None
@@ -535,6 +2067,24 @@ class AIConversationService:
         asyncio.create_task(self.safe_compress_if_needed(guild.id, user.id))
         return answer
 
+    async def run_tool(
+        self, context: ToolExecutionContext, tool_call: dict[str, object]
+    ) -> ToolResult:
+        tool_name = str(tool_call.get("tool") or "").strip().lower()
+        tool = self.tool_registry.get(tool_name)
+        if tool is None:
+            return ToolResult(f"알 수 없는 도구입니다: {tool_name}", final=True)
+        if tool.admin_only and not context.is_admin:
+            return ToolResult(f"{tool_name} 도구는 서버 관리자만 사용할 수 있습니다.", final=True)
+        arguments = tool_call
+        nested = tool_call.get("arguments")
+        if isinstance(nested, dict):
+            arguments = {**tool_call, **nested}
+        try:
+            return await tool.run(context, arguments)
+        except Exception as exc:
+            return ToolResult(f"{tool_name} 도구 실행 중 오류가 발생했습니다: {exc}")
+
     async def build_prompt(
         self,
         guild_id: int,
@@ -543,66 +2093,86 @@ class AIConversationService:
         kind: str,
         always_reply: bool,
         media_path: Path | None = None,
+        is_admin: bool = False,
+        tool_outputs: list[str] | None = None,
     ) -> str:
-        user_summary, guild_summary, recent_user, recent_guild = await asyncio.gather(
+        user_summary, recent_user = await asyncio.gather(
             self.store.fetch_user_summary(guild_id, user.id),
-            self.store.fetch_guild_summary(guild_id),
-            self.store.fetch_recent_user(guild_id, user.id, 18),
-            self.store.fetch_recent_guild(guild_id, 24),
+            self.store.fetch_recent_user(guild_id, user.id, 3),
         )
 
         user_history = "\n".join(
-            f"- {row['author_name']}({row['role']}): {row['content']}" for row in recent_user
+            f"- {row['author_name']}({row['role']}): {row['content']}"
+            for row in recent_user
         )
-        guild_history = "\n".join(
-            f"- {row['author_name']}: {row['content']}" for row in recent_guild
-        )
+        tool_output_text = "\n\n".join(tool_outputs or [])
 
         voice_instruction = ""
         if kind == "voice" and not always_reply:
-            voice_instruction = (
-                "\n음성 입력이 봇에게 하는 말이 아니거나 배경 대화로 보이면 정확히 NO_REPLY만 출력하세요."
-            )
+            voice_instruction = "\nIf the voice input is background talk or not addressed to the bot, output exactly NO_REPLY."
 
         current_input = content
         if kind == "voice":
-            current_input = "첨부된 WAV 오디오를 먼저 듣고 그 발화에 답하세요."
+            current_input = "Listen to the attached WAV audio and answer the utterance."
         elif media_path is not None and media_path.suffix.lower() in AUDIO_SUFFIXES:
-            current_input = f"{content}\n\n첨부된 오디오를 먼저 듣고, 텍스트 요청과 함께 답하세요."
+            current_input = (
+                f"{content}\n\nListen to the attached audio and answer together with the text request."
+            )
         elif media_path is not None and media_path.suffix.lower() in IMAGE_SUFFIXES:
-            current_input = f"{content}\n\n첨부된 이미지를 보고, 텍스트 요청과 함께 답하세요."
+            current_input = (
+                f"{content}\n\nInspect the attached image and answer together with the text request."
+            )
 
-        web_search_instruction = (
-            "\n최신 정보, 현재 상태, 가격, 일정, 규정, 뉴스, 외부 사실 확인이 필요한 경우 "
-            "답변 대신 정확히 `WEB_SEARCH: 검색어` 한 줄만 출력하세요."
-            if self.web_search.enabled
-            else ""
+        local_system_prompt = self.load_local_system_prompt()
+        permission_label = "서버 관리자" if is_admin else "일반 사용자"
+        permission_instruction = (
+            "The user is a Discord server administrator. You may answer admin-operation questions."
+            if is_admin
+            else "The user is not an administrator. Do not perform or bypass admin-only operations; tell them to ask an admin."
         )
-
         return f"""
-당신은 Discord 서버의 한국어 AI 대화 봇입니다.
-사용자별 장기 memory, 최근 대화, 서버의 공유 문맥을 참고해 자연스럽고 짧게 답하세요.
-서버 공유 문맥은 참고용이며, 다른 사용자의 사적인 정보를 단정하거나 노출하지 마세요.
-내부 추론이나 thought 태그를 출력하지 말고 최종 답변만 출력하세요.{voice_instruction}{web_search_instruction}
+You are a friendly Discord assistant.
+Reply in Korean with a warm, natural, slightly casual tone. Be concise, but not stiff.
+Use only Discord-supported Markdown: plain text, newlines, `- ` lists, `1. ` lists, bold, italic, underline, strikethrough, inline code, code blocks, and URLs.
+Do not output HTML, Markdown tables, headings, checkboxes, footnotes, collapsible syntax, LaTeX math, raw mass mentions, hidden reasoning, analysis, chain-of-thought, `<think>` tags, or labels like Final/Answer/Analysis.
+If you do not know, say you do not know. Do not invent sources, facts, URLs, memories, or server context.
+Only the current user's memory and last 3 direct messages are included. For server-wide context, other users, Discord channel history, or DB history, call a tool.
+Call at most one tool before the final answer unless absolutely necessary.
+When a tool is needed, output exactly one JSON object and no other text. If no tool is needed, answer normally.
 
-[현재 사용자]
+Tools:
+{self.tool_registry.instructions()}{voice_instruction}
+
+[Local prompt: ai_prompt.md]
+{local_system_prompt or "None"}
+
+[Permissions]
+Current user: {permission_label}
+{permission_instruction}
+
+[Current user]
 {user.display_name} ({user.id})
 
-[사용자 장기 memory]
-{user_summary or "아직 없음"}
+[User memory]
+{user_summary or "None"}
 
-[서버 공유 context 요약]
-{guild_summary or "아직 없음"}
+[Recent direct conversation, max 3]
+{user_history or "None"}
 
-[이 사용자와의 최근 대화]
-{user_history or "아직 없음"}
+[Tool results]
+{tool_output_text or "None"}
 
-[서버의 최근 공개 대화]
-{guild_history or "아직 없음"}
-
-[현재 요청]
+[Current request]
 {current_input}
 """.strip()
+
+    def load_local_system_prompt(self) -> str:
+        try:
+            if AI_PROMPT_PATH.exists():
+                return AI_PROMPT_PATH.read_text(encoding="utf-8").strip()[:2000]
+        except OSError as exc:
+            return f"ai_prompt.md를 읽지 못했습니다: {exc}"
+        return ""
 
     def extract_search_query(self, answer: str) -> str | None:
         match = re.search(r"(?im)^\s*WEB_SEARCH\s*:\s*(.+?)\s*$", answer)
@@ -610,6 +2180,16 @@ class AIConversationService:
             return None
         query = match.group(1).strip().strip("\"'")
         return query[:300] or None
+
+    def extract_tool_call(self, answer: str) -> dict[str, object] | None:
+        data = extract_json_object(answer)
+        if not data:
+            return None
+        tool = str(data.get("tool") or "").strip().lower()
+        if tool not in self.tool_registry.names():
+            return None
+        data["tool"] = tool
+        return data
 
     def build_search_answer_prompt(
         self,
@@ -624,7 +2204,8 @@ class AIConversationService:
         return f"""
 아래는 사용자의 원래 대화 context와 웹검색 결과입니다.
 검색 결과에 근거해 한국어로 답하세요. 확실하지 않은 부분은 모른다고 말하세요.
-가능하면 관련 URL을 1개 이상 포함하세요. 내부 추론은 출력하지 마세요.
+아래 WEB_RESULTS에 있는 URL만 사용할 수 있습니다. 검색 결과에 없는 URL, 제목, 출처는 만들지 마세요.
+가능하면 관련 URL을 1개 이상 포함하세요. 내부 추론, reasoning, analysis, thought, `<think>` 태그는 절대 출력하지 마세요. 최종 답변 본문만 출력하세요.
 
 [원래 context]
 {original_prompt}
@@ -635,6 +2216,19 @@ class AIConversationService:
 [WEB_RESULTS]
 {formatted_results}
 """.strip()
+
+    def append_actual_sources(
+        self, answer: str, results: list[WebSearchResult]
+    ) -> str:
+        allowed_urls = [result.url for result in results if result.url]
+        if not allowed_urls:
+            return answer
+        if any(url in answer for url in allowed_urls):
+            return answer
+        source_lines = "\n".join(
+            f"- {result.title}: {result.url}" for result in results[:3]
+        )
+        return f"{answer.rstrip()}\n\n실제 검색 결과:\n{source_lines}"
 
     async def compress_if_needed(self, guild_id: int, user_id: int) -> None:
         async with self.compress_lock:
@@ -666,7 +2260,9 @@ class AIConversationService:
         try:
             await self.compress_if_needed(guild_id, user_id)
         except Exception as exc:
-            print(f"Context compression failed for guild={guild_id} user={user_id}: {exc}")
+            print(
+                f"Context compression failed for guild={guild_id} user={user_id}: {exc}"
+            )
 
     async def summarize_rows(
         self, old_summary: str, rows: list[sqlite3.Row], instruction: str
@@ -705,7 +2301,9 @@ class SupertonicSpeaker:
         out_path = self.output_dir / f"tts_{guild_id}_{int(time.time() * 1000)}.wav"
 
         async with self.lock:
-            await asyncio.to_thread(self._synthesize_sync, guild_id, text, settings, out_path)
+            await asyncio.to_thread(
+                self._synthesize_sync, guild_id, text, settings, out_path
+            )
         return out_path
 
     def _load_tts(self):
@@ -723,7 +2321,9 @@ class SupertonicSpeaker:
         if voice_style_path and Path(voice_style_path).exists():
             style = tts.get_voice_style_from_path(voice_style_path)
         else:
-            style = tts.get_voice_style(settings.get("voice_name") or SUPERTONIC_DEFAULT_VOICE)
+            style = tts.get_voice_style(
+                settings.get("voice_name") or SUPERTONIC_DEFAULT_VOICE
+            )
         wav_data, _duration = tts.synthesize(
             text,
             voice_style=style,
@@ -756,29 +2356,161 @@ class Music(commands.Cog):
     def state_for(self, guild: discord.Guild) -> GuildMusicState:
         return self.states.setdefault(guild.id, GuildMusicState())
 
-    async def extract_track(self, query: str) -> Track:
-        loop = asyncio.get_running_loop()
+    @commands.Cog.listener()
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ) -> None:
+        if member.bot:
+            return
+        voice_client = member.guild.voice_client
+        if voice_client is None or not voice_client.is_connected():
+            return
+        if before.channel == voice_client.channel or after.channel == voice_client.channel:
+            if self.voice_channel_is_empty(voice_client):
+                self.schedule_empty_voice_check(member.guild)
+            else:
+                self.cancel_empty_voice_task(member.guild)
 
-        def extract() -> dict:
-            with yt_dlp.YoutubeDL(YTDL_OPTIONS) as extractor:
-                return extractor.extract_info(query, download=False)
+    def track_key(self, track: Track | None) -> str | None:
+        if track is None:
+            return None
+        return track.webpage_url or track.stream_url or track.title
 
+    def voice_voters_for(
+        self, voice_client: discord.VoiceClient
+    ) -> list[discord.Member]:
+        channel = getattr(voice_client, "channel", None)
+        if channel is None:
+            return []
+        return [member for member in channel.members if not member.bot]
+
+    def human_members_in_voice(
+        self, voice_client: discord.VoiceClient | None
+    ) -> list[discord.Member]:
+        channel = getattr(voice_client, "channel", None)
+        if channel is None:
+            return []
+        return [member for member in channel.members if not member.bot]
+
+    def voice_channel_is_empty(self, voice_client: discord.VoiceClient | None) -> bool:
+        return bool(
+            voice_client
+            and voice_client.is_connected()
+            and not self.human_members_in_voice(voice_client)
+        )
+
+    def remember_text_channel(
+        self, guild: discord.Guild, channel: discord.abc.Messageable | None
+    ) -> None:
+        channel_id = getattr(channel, "id", None)
+        if isinstance(channel_id, int):
+            self.state_for(guild).last_text_channel_id = channel_id
+
+    def cancel_empty_voice_task(self, guild: discord.Guild) -> None:
+        state = self.state_for(guild)
+        task = state.empty_voice_task
+        if task and not task.done():
+            task.cancel()
+        state.empty_voice_task = None
+
+    def schedule_empty_voice_check(self, guild: discord.Guild) -> None:
+        voice_client = guild.voice_client
+        state = self.state_for(guild)
+        if not self.voice_channel_is_empty(voice_client):
+            self.cancel_empty_voice_task(guild)
+            return
+        if state.empty_voice_task and not state.empty_voice_task.done():
+            return
+        state.empty_voice_task = asyncio.create_task(
+            self.disconnect_if_voice_stays_empty(guild.id)
+        )
+
+    async def disconnect_if_voice_stays_empty(self, guild_id: int) -> None:
         try:
-            data = await loop.run_in_executor(None, extract)
-        except yt_dlp.utils.DownloadError as exc:
-            raise MusicError("노래를 찾거나 읽을 수 없어요. URL이나 검색어를 확인해 주세요.") from exc
-        except Exception as exc:
-            raise MusicError("yt-dlp 처리 중 오류가 발생했어요.") from exc
+            await asyncio.sleep(VOICE_EMPTY_DISCONNECT_SECONDS)
+            guild = self.bot.get_guild(guild_id)
+            if guild is None:
+                return
+            voice_client = guild.voice_client
+            if not self.voice_channel_is_empty(voice_client):
+                return
 
-        if not data:
-            raise MusicError("검색 결과가 없어요.")
+            state = self.state_for(guild)
+            state.queue.clear()
+            state.history.clear()
+            state.current = None
+            state.replay_current = None
+            state.skip_votes.clear()
+            state.skip_vote_track_key = None
+            state.queue_remove_votes.clear()
 
-        if "entries" in data:
-            entries = [entry for entry in data["entries"] if entry]
-            if not entries:
-                raise MusicError("검색 결과가 없어요.")
-            data = entries[0]
+            if voice_client:
+                if voice_client.is_playing() or voice_client.is_paused():
+                    self.stop_playback(voice_client)
+                await voice_client.disconnect(force=True)
 
+            channel = (
+                guild.get_channel(state.last_text_channel_id)
+                if state.last_text_channel_id
+                else None
+            )
+            if channel is not None and hasattr(channel, "send"):
+                await channel.send(
+                    "음성 채널에 사람이 없어서 재생을 멈추고 나왔어요."
+                )
+        except asyncio.CancelledError:
+            return
+        finally:
+            guild = self.bot.get_guild(guild_id)
+            if guild is not None:
+                self.state_for(guild).empty_voice_task = None
+
+    def skip_voters_for(
+        self, voice_client: discord.VoiceClient
+    ) -> list[discord.Member]:
+        return [
+            member
+            for member in self.voice_voters_for(voice_client)
+            if not getattr(member.guild_permissions, "administrator", False)
+        ]
+
+    def required_skip_votes(self, voice_client: discord.VoiceClient) -> int:
+        voters = self.skip_voters_for(voice_client)
+        return max(1, len(voters) // 2 + 1)
+
+    def required_percent_votes(
+        self, voice_client: discord.VoiceClient, ratio: float
+    ) -> int:
+        voters = self.voice_voters_for(voice_client)
+        return max(1, math.ceil(len(voters) * ratio))
+
+    def user_in_bot_voice(self, interaction: discord.Interaction) -> bool:
+        voice_client = interaction.guild.voice_client if interaction.guild else None
+        user_voice = getattr(interaction.user, "voice", None)
+        return bool(
+            voice_client
+            and user_voice
+            and user_voice.channel
+            and user_voice.channel == voice_client.channel
+        )
+
+    def is_admin_interaction(self, interaction: discord.Interaction) -> bool:
+        permissions = getattr(interaction.user, "guild_permissions", None)
+        return bool(getattr(permissions, "administrator", False))
+
+    def remember_current(self, state: GuildMusicState) -> None:
+        if state.current is not None:
+            state.history.append(state.current)
+        state.current = None
+
+    def is_playlist_query(self, query: str) -> bool:
+        lowered = query.lower()
+        return "list=" in lowered or "/playlist" in lowered
+
+    def track_from_data(self, query: str, data: dict) -> Track:
         stream_url = data.get("url")
         title = data.get("title")
         if not stream_url or not title:
@@ -791,7 +2523,62 @@ class Music(commands.Cog):
             webpage_url=data.get("webpage_url"),
         )
 
-    async def connect_author(self, interaction: discord.Interaction) -> discord.VoiceClient:
+    async def extract_track(self, query: str) -> Track:
+        tracks = await self.extract_tracks(query)
+        if not tracks:
+            raise MusicError("검색 결과가 없어요.")
+        return tracks[0]
+
+    async def extract_tracks(self, query: str) -> list[Track]:
+        loop = asyncio.get_running_loop()
+        allow_playlist = self.is_playlist_query(query)
+
+        def extract() -> dict:
+            options = {**YTDL_OPTIONS, "noplaylist": not allow_playlist}
+            with yt_dlp.YoutubeDL(options) as extractor:
+                return extractor.extract_info(query, download=False)
+
+        try:
+            data = await loop.run_in_executor(None, extract)
+        except yt_dlp.utils.DownloadError as exc:
+            raise MusicError(
+                "노래를 찾거나 읽을 수 없어요. URL이나 검색어를 확인해 주세요."
+            ) from exc
+        except Exception as exc:
+            raise MusicError("yt-dlp 처리 중 오류가 발생했어요.") from exc
+
+        if not data:
+            raise MusicError("검색 결과가 없어요.")
+
+        if "entries" in data:
+            entries = [entry for entry in data["entries"] if entry]
+            if not entries:
+                raise MusicError("검색 결과가 없어요.")
+            if allow_playlist:
+                tracks = []
+                for entry in entries[:MAX_PLAYLIST_TRACKS]:
+                    try:
+                        tracks.append(self.track_from_data(query, entry))
+                    except MusicError:
+                        continue
+                if not tracks:
+                    raise MusicError("재생 가능한 playlist 항목이 없어요.")
+                return tracks
+            data = entries[0]
+
+        return [self.track_from_data(query, data)]
+
+    def ffmpeg_options_for(self, track: Track) -> dict[str, str]:
+        options = dict(FFMPEG_OPTIONS)
+        if track.start_time > 0:
+            options["before_options"] = (
+                f"-ss {track.start_time:.3f} " + options["before_options"]
+            )
+        return options
+
+    async def connect_author(
+        self, interaction: discord.Interaction
+    ) -> discord.VoiceClient:
         if interaction.guild is None:
             raise MusicError("서버 채널에서만 사용할 수 있어요.")
 
@@ -810,10 +2597,82 @@ class Music(commands.Cog):
 
         return voice_client
 
+    async def connect_member(
+        self, guild: discord.Guild, member: discord.Member
+    ) -> discord.VoiceClient:
+        voice_state = getattr(member, "voice", None)
+        if voice_state is None or voice_state.channel is None:
+            raise MusicError("먼저 음성 채널에 들어가 주세요.")
+
+        voice_client = guild.voice_client
+        if voice_client is None:
+            if voice_recv is not None:
+                return await voice_state.channel.connect(cls=voice_recv.VoiceRecvClient)
+            return await voice_state.channel.connect()
+
+        if voice_client.channel != voice_state.channel:
+            await voice_client.move_to(voice_state.channel)
+
+        return voice_client
+
+    async def search_youtube_track(self, query: str) -> Track:
+        tracks = await self.extract_tracks(f"ytsearch1:{query}")
+        if not tracks:
+            raise MusicError(f"YouTube에서 `{query}`를 찾지 못했어요.")
+        return tracks[0]
+
+    async def search_youtube_tracks(self, query: str, count: int) -> list[Track]:
+        count = max(1, min(count, 10))
+        tracks = await self.extract_tracks(f"ytsearch{count}:{query}")
+        if not tracks:
+            raise MusicError(f"YouTube에서 `{query}`를 찾지 못했어요.")
+        return tracks[:count]
+
+    async def enqueue_recommendation_query(
+        self,
+        guild: discord.Guild,
+        member: discord.Member,
+        channel: discord.abc.Messageable,
+        query: str,
+        count: int,
+    ) -> list[Track]:
+        await self.connect_member(guild, member)
+        self.remember_text_channel(guild, channel)
+        tracks = await self.search_youtube_tracks(query, count)
+        state = self.state_for(guild)
+        state.queue.extend(tracks)
+        await self.start_next(guild, channel)
+        return tracks
+
+    async def enqueue_recommendation_tracks(
+        self,
+        guild: discord.Guild,
+        member: discord.Member,
+        channel: discord.abc.Messageable,
+        queries: list[str],
+    ) -> list[Track]:
+        await self.connect_member(guild, member)
+        self.remember_text_channel(guild, channel)
+        tracks: list[Track] = []
+        for query in queries:
+            try:
+                tracks.append(await self.search_youtube_track(query))
+            except MusicError:
+                continue
+
+        if not tracks:
+            raise MusicError("추천곡을 YouTube에서 찾지 못했어요.")
+
+        state = self.state_for(guild)
+        state.queue.extend(tracks)
+        await self.start_next(guild, channel)
+        return tracks
+
     async def start_next(
         self, guild: discord.Guild, channel: discord.abc.Messageable
     ) -> None:
         state = self.state_for(guild)
+        self.remember_text_channel(guild, channel)
 
         start_failed = False
         started_title = None
@@ -823,20 +2682,32 @@ class Music(commands.Cog):
             if voice_client is None or not voice_client.is_connected():
                 state.current = None
                 return
+            if self.voice_channel_is_empty(voice_client):
+                self.schedule_empty_voice_check(guild)
+                return
 
             if voice_client.is_playing() or voice_client.is_paused():
                 return
 
-            if not state.queue:
+            if state.replay_current is not None:
+                track = state.replay_current
+                state.replay_current = None
+            elif state.queue:
+                self.remember_current(state)
+                track = state.queue.popleft()
+            else:
                 state.current = None
                 return
-
-            track = state.queue.popleft()
             state.current = track
+            state.skip_votes.clear()
+            state.skip_vote_track_key = self.track_key(track)
+            state.queue_remove_votes.clear()
 
             try:
                 source = discord.PCMVolumeTransformer(
-                    discord.FFmpegPCMAudio(track.stream_url, **FFMPEG_OPTIONS),
+                    discord.FFmpegPCMAudio(
+                        track.stream_url, **self.ffmpeg_options_for(track)
+                    ),
                     volume=state.volume,
                 )
                 voice_client.play(
@@ -850,14 +2721,25 @@ class Music(commands.Cog):
                 await channel.send(f"재생을 시작하지 못했어요: {exc}")
                 start_failed = True
             else:
-                started_title = track.title
+                started_title = format_track_link(track, suppress_embed=True)
 
         if start_failed:
             await self.start_next(guild, channel)
             return
 
         if started_title:
-            await channel.send(f"지금 재생중: {started_title}")
+            if state.current and state.current.start_time > 0:
+                await send_message(
+                    channel,
+                    f"지금 재생중: {started_title} ({format_timestamp(state.current.start_time)}부터)",
+                    suppress_embeds=True,
+                )
+            else:
+                await send_message(
+                    channel,
+                    f"지금 재생중: {started_title}",
+                    suppress_embeds=True,
+                )
 
     async def after_track(
         self,
@@ -866,7 +2748,10 @@ class Music(commands.Cog):
         error: Exception | None,
     ) -> None:
         state = self.state_for(guild)
-        state.current = None
+        self.remember_current(state)
+        state.skip_votes.clear()
+        state.skip_vote_track_key = None
+        state.queue_remove_votes.clear()
 
         if error:
             await channel.send(f"재생 중 오류가 발생했어요: {error}")
@@ -879,22 +2764,76 @@ class Music(commands.Cog):
         else:
             voice_client.stop()
 
-    @app_commands.command(name="play", description="노래를 대기열에 추가하고 재생합니다.")
+    @app_commands.command(
+        name="play", description="노래를 대기열에 추가하고 재생합니다."
+    )
     @app_commands.describe(query="URL 또는 검색어")
     @app_commands.guild_only()
     async def play(self, interaction: discord.Interaction, query: str) -> None:
         await interaction.response.defer()
         try:
             await self.connect_author(interaction)
-            track = await self.extract_track(query)
+            tracks = await self.extract_tracks(query)
         except MusicError as exc:
             await interaction.followup.send(str(exc))
             return
 
         state = self.state_for(interaction.guild)
-        state.queue.append(track)
-        await interaction.followup.send(f"대기열에 추가했어요: {track.title}")
+        self.remember_text_channel(interaction.guild, interaction.channel)
+        state.queue.extend(tracks)
+        if len(tracks) == 1:
+            await send_interaction(
+                interaction,
+                f"대기열에 추가했어요: {format_track_link(tracks[0], suppress_embed=True)}",
+                suppress_embeds=True,
+            )
+        else:
+            await send_interaction(
+                interaction,
+                f"playlist에서 {len(tracks)}곡을 대기열에 추가했어요. "
+                f"첫 곡: {format_track_link(tracks[0], suppress_embed=True)}",
+                suppress_embeds=True,
+            )
         await self.start_next(interaction.guild, interaction.channel)
+
+    @app_commands.command(
+        name="seek", description="현재 영상/곡을 지정한 timestamp로 이동합니다."
+    )
+    @app_commands.describe(timestamp="예: 90, 1:30, 01:02:03, 1m30s")
+    @app_commands.guild_only()
+    async def seek(self, interaction: discord.Interaction, timestamp: str) -> None:
+        state = self.state_for(interaction.guild)
+        voice_client = interaction.guild.voice_client
+        if voice_client is None or not voice_client.is_connected():
+            await send_interaction(
+                interaction, "봇이 음성 채널에 연결되어 있지 않아요."
+            )
+            return
+
+        if state.current is None:
+            await send_interaction(interaction, "이동할 현재 곡이 없어요.")
+            return
+
+        try:
+            seconds = parse_timestamp(timestamp)
+        except ValueError:
+            await send_interaction(
+                interaction,
+                "timestamp 형식은 `90`, `1:30`, `01:02:03`, `1m30s`처럼 입력해 주세요.",
+            )
+            return
+
+        track_title = state.current.title
+        state.current.start_time = max(0.0, seconds)
+        state.replay_current = state.current
+        if voice_client.is_playing() or voice_client.is_paused():
+            self.stop_playback(voice_client)
+        else:
+            await self.start_next(interaction.guild, interaction.channel)
+        await send_interaction(
+            interaction,
+            f"`{sanitize_discord_markdown(track_title)}`을 {format_timestamp(seconds)} 지점으로 이동할게요.",
+        )
 
     @app_commands.command(name="skip", description="현재 노래를 건너뜁니다.")
     @app_commands.guild_only()
@@ -903,20 +2842,109 @@ class Music(commands.Cog):
         voice_client = interaction.guild.voice_client
 
         if voice_client is None or not voice_client.is_connected():
-            await send_interaction(interaction, "봇이 음성 채널에 연결되어 있지 않아요.")
+            await send_interaction(
+                interaction, "봇이 음성 채널에 연결되어 있지 않아요."
+            )
             return
+
+        if self.is_admin_interaction(interaction):
+            if voice_client.is_playing() or voice_client.is_paused():
+                self.stop_playback(voice_client)
+                await send_interaction(
+                    interaction, "관리자 권한으로 현재 노래를 건너뛰었어요."
+                )
+                return
+            if state.queue:
+                await self.start_next(interaction.guild, interaction.channel)
+                await send_interaction(
+                    interaction, "관리자 권한으로 다음 노래를 재생할게요."
+                )
+                return
+            await send_interaction(interaction, "건너뛸 노래가 없어요.")
+            return
+
+        if not self.user_in_bot_voice(interaction):
+            await send_interaction(
+                interaction,
+                "같은 음성 채널에 있는 사람만 skip 투표를 할 수 있어요.",
+                ephemeral=True,
+            )
+            return
+
+        if state.current is None and not (
+            voice_client.is_playing() or voice_client.is_paused()
+        ):
+            if state.queue:
+                await self.start_next(interaction.guild, interaction.channel)
+                await send_interaction(interaction, "다음 노래를 재생할게요.")
+                return
+            await send_interaction(interaction, "건너뛸 노래가 없어요.")
+            return
+
+        current_key = self.track_key(state.current)
+        if state.skip_vote_track_key != current_key:
+            state.skip_votes.clear()
+            state.skip_vote_track_key = current_key
+
+        voters = self.skip_voters_for(voice_client)
+        required = self.required_skip_votes(voice_client)
+        state.skip_votes.add(interaction.user.id)
+        valid_voter_ids = {member.id for member in voters}
+        state.skip_votes.intersection_update(valid_voter_ids)
+
+        if len(state.skip_votes) >= required:
+            state.skip_votes.clear()
+            state.skip_vote_track_key = None
+            self.stop_playback(voice_client)
+            await send_interaction(
+                interaction,
+                f"skip 투표가 과반수에 도달했어요. ({required}/{len(voters)}, 봇/관리자 제외 기준) 현재 노래를 건너뜁니다.",
+            )
+            return
+
+        await send_interaction(
+            interaction,
+            f"skip 투표를 기록했어요. ({len(state.skip_votes)}/{required}, 봇/관리자 제외 {len(voters)}명 기준)",
+        )
+
+    @app_commands.command(
+        name="back", description="이전 노래로 돌아갑니다. 관리자 전용."
+    )
+    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.guild_only()
+    async def back(self, interaction: discord.Interaction) -> None:
+        state = self.state_for(interaction.guild)
+        voice_client = interaction.guild.voice_client
+
+        if voice_client is None or not voice_client.is_connected():
+            await send_interaction(
+                interaction, "봇이 음성 채널에 연결되어 있지 않아요."
+            )
+            return
+
+        if not state.history:
+            await send_interaction(interaction, "이전 노래 기록이 없어요.")
+            return
+
+        previous = state.history.pop()
+        previous.start_time = 0.0
+        if state.current is not None:
+            state.queue.appendleft(state.current)
+        state.replay_current = previous
+        state.skip_votes.clear()
+        state.skip_vote_track_key = None
+        state.queue_remove_votes.clear()
 
         if voice_client.is_playing() or voice_client.is_paused():
             self.stop_playback(voice_client)
-            await send_interaction(interaction, "현재 노래를 건너뛰었어요.")
-            return
-
-        if state.queue:
+        else:
             await self.start_next(interaction.guild, interaction.channel)
-            await send_interaction(interaction, "다음 노래를 재생할게요.")
-            return
 
-        await send_interaction(interaction, "건너뛸 노래가 없어요.")
+        await send_interaction(
+            interaction,
+            f"이전 노래로 돌아갈게요: {format_track_link(previous, suppress_embed=True)}",
+            suppress_embeds=True,
+        )
 
     @app_commands.command(name="queue", description="현재 대기열을 보여줍니다.")
     @app_commands.guild_only()
@@ -929,23 +2957,120 @@ class Music(commands.Cog):
 
         lines = []
         if state.current:
-            lines.append(f"재생 중: {state.current.title}")
+            lines.append(f"재생 중: {format_track_link(state.current, suppress_embed=True)}")
 
         lines.extend(
-            f"{index}. {track.title}" for index, track in enumerate(state.queue, start=1)
+            f"{index}. {format_track_link(track, suppress_embed=True)}"
+            for index, track in enumerate(state.queue, start=1)
         )
-        await send_interaction(interaction, "현재 대기열:\n" + "\n".join(lines))
+        await send_interaction(
+            interaction,
+            "현재 대기열:\n" + "\n".join(lines),
+            suppress_embeds=True,
+        )
+
+    @app_commands.command(
+        name="queue_remove",
+        description="대기열의 특정 곡을 삭제합니다. 음성 채널 30% 투표가 필요합니다.",
+    )
+    @app_commands.describe(index="대기열 번호입니다. /queue에 보이는 번호를 입력하세요.")
+    @app_commands.guild_only()
+    async def queue_remove(self, interaction: discord.Interaction, index: int) -> None:
+        state = self.state_for(interaction.guild)
+        voice_client = interaction.guild.voice_client
+
+        if voice_client is None or not voice_client.is_connected():
+            await send_interaction(
+                interaction, "봇이 음성 채널에 연결되어 있지 않아요."
+            )
+            return
+
+        if index < 1 or index > len(state.queue):
+            await send_interaction(
+                interaction,
+                f"삭제할 수 있는 대기열 번호가 아니에요. 현재 대기열은 {len(state.queue)}곡입니다.",
+                ephemeral=True,
+            )
+            return
+
+        if self.is_admin_interaction(interaction):
+            removed = state.queue[index - 1]
+            del state.queue[index - 1]
+            state.queue_remove_votes.clear()
+            await send_interaction(
+                interaction,
+                f"관리자 권한으로 대기열 {index}번을 삭제했어요: {format_track_link(removed, suppress_embed=True)}",
+                suppress_embeds=True,
+            )
+            return
+
+        if not self.user_in_bot_voice(interaction):
+            await send_interaction(
+                interaction,
+                "같은 음성 채널에 있는 사람만 queue_remove 투표를 할 수 있어요.",
+                ephemeral=True,
+            )
+            return
+
+        voters = self.voice_voters_for(voice_client)
+        required = self.required_percent_votes(voice_client, 0.3)
+        votes = state.queue_remove_votes.setdefault(index, set())
+        votes.add(interaction.user.id)
+        votes.intersection_update({member.id for member in voters})
+
+        if len(votes) >= required:
+            removed = state.queue[index - 1]
+            del state.queue[index - 1]
+            state.queue_remove_votes.clear()
+            await send_interaction(
+                interaction,
+                f"queue_remove 투표가 30%에 도달했어요. ({required}/{len(voters)}, 봇 제외 기준) 삭제: {format_track_link(removed, suppress_embed=True)}",
+                suppress_embeds=True,
+            )
+            return
+
+        await send_interaction(
+            interaction,
+            f"queue_remove 투표를 기록했어요. ({len(votes)}/{required}, 봇 제외 {len(voters)}명 기준)",
+        )
+
+    @app_commands.command(
+        name="queue_clear", description="대기열을 비웁니다. 관리자 전용."
+    )
+    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.guild_only()
+    async def queue_clear(self, interaction: discord.Interaction) -> None:
+        state = self.state_for(interaction.guild)
+        cleared_count = len(state.queue)
+        state.queue.clear()
+        state.skip_votes.clear()
+        state.skip_vote_track_key = self.track_key(state.current)
+        state.queue_remove_votes.clear()
+
+        if cleared_count == 0:
+            await send_interaction(interaction, "비울 대기열이 없어요.", ephemeral=True)
+            return
+
+        await send_interaction(interaction, f"대기열 {cleared_count}곡을 비웠어요.")
 
     @app_commands.command(name="stop", description="재생을 멈추고 대기열을 비웁니다.")
     @app_commands.guild_only()
     async def stop(self, interaction: discord.Interaction) -> None:
         state = self.state_for(interaction.guild)
+        self.cancel_empty_voice_task(interaction.guild)
         state.queue.clear()
+        state.history.clear()
         state.current = None
+        state.replay_current = None
+        state.skip_votes.clear()
+        state.skip_vote_track_key = None
+        state.queue_remove_votes.clear()
 
         voice_client = interaction.guild.voice_client
         if voice_client is None or not voice_client.is_connected():
-            await send_interaction(interaction, "봇이 음성 채널에 연결되어 있지 않아요.")
+            await send_interaction(
+                interaction, "봇이 음성 채널에 연결되어 있지 않아요."
+            )
             return
 
         await voice_client.disconnect()
@@ -956,7 +3081,9 @@ class Music(commands.Cog):
     async def pause(self, interaction: discord.Interaction) -> None:
         voice_client = interaction.guild.voice_client
         if voice_client is None or not voice_client.is_connected():
-            await send_interaction(interaction, "봇이 음성 채널에 연결되어 있지 않아요.")
+            await send_interaction(
+                interaction, "봇이 음성 채널에 연결되어 있지 않아요."
+            )
             return
 
         if not voice_client.is_playing():
@@ -966,12 +3093,16 @@ class Music(commands.Cog):
         voice_client.pause()
         await send_interaction(interaction, "음악을 일시정지했어요.")
 
-    @app_commands.command(name="resume", description="일시정지된 노래를 다시 재생합니다.")
+    @app_commands.command(
+        name="resume", description="일시정지된 노래를 다시 재생합니다."
+    )
     @app_commands.guild_only()
     async def resume(self, interaction: discord.Interaction) -> None:
         voice_client = interaction.guild.voice_client
         if voice_client is None or not voice_client.is_connected():
-            await send_interaction(interaction, "봇이 음성 채널에 연결되어 있지 않아요.")
+            await send_interaction(
+                interaction, "봇이 음성 채널에 연결되어 있지 않아요."
+            )
             return
 
         if not voice_client.is_paused():
@@ -981,18 +3112,520 @@ class Music(commands.Cog):
         voice_client.resume()
         await send_interaction(interaction, "음악을 다시 재생했어요.")
 
-    @app_commands.command(name="volume", description="음량을 0부터 200 사이로 설정합니다.")
+    @app_commands.command(
+        name="volume", description="음량을 0부터 200 사이로 설정합니다."
+    )
     @app_commands.describe(volume="0부터 200 사이의 음량")
     @app_commands.guild_only()
-    async def volume(self, interaction: discord.Interaction, volume: app_commands.Range[int, 0, 200]) -> None:
+    async def volume(
+        self, interaction: discord.Interaction, volume: app_commands.Range[int, 0, 200]
+    ) -> None:
         state = self.state_for(interaction.guild)
         state.volume = volume / 100
 
         voice_client = interaction.guild.voice_client
-        if voice_client and voice_client.source and hasattr(voice_client.source, "volume"):
+        if (
+            voice_client
+            and voice_client.source
+            and hasattr(voice_client.source, "volume")
+        ):
             voice_client.source.volume = state.volume
 
         await send_interaction(interaction, f"음량을 {volume}%로 변경했어요.")
+
+
+class BaseGameSession:
+    def __init__(
+        self,
+        cog: "PartyGames",
+        channel: discord.abc.Messageable,
+        owner: discord.Member | discord.User,
+        title: str,
+    ):
+        self.cog = cog
+        self.channel = channel
+        self.owner = owner
+        self.title = title
+        owner_name = getattr(owner, "display_name", owner.name)
+        self.participants: dict[int, str] = {owner.id: owner_name}
+        self.started = False
+        self.active = True
+        self.last_activity = time.monotonic()
+        self.timeout_task: asyncio.Task | None = None
+        self.recruit_message: discord.Message | None = None
+
+    def touch(self) -> None:
+        self.last_activity = time.monotonic()
+
+    def can_control(self, user: discord.abc.User) -> bool:
+        permissions = getattr(user, "guild_permissions", None)
+        return user.id == self.owner.id or bool(getattr(permissions, "administrator", False))
+
+    def join(self, user: discord.abc.User) -> bool:
+        if self.started or not self.active:
+            return False
+        self.participants[user.id] = getattr(user, "display_name", user.name)
+        self.touch()
+        return True
+
+    def recruit_content(self) -> str:
+        names = ", ".join(self.participants.values()) or "없음"
+        return (
+            f"**{self.title}** 참가자를 모집하고 있어요.\n"
+            f"참가자 {len(self.participants)}명: {names}\n"
+            "참여할 사람은 버튼을 누르고, 준비되면 시작해 주세요."
+        )
+
+    def start_timeout(self) -> None:
+        if self.timeout_task is None or self.timeout_task.done():
+            self.timeout_task = asyncio.create_task(self._timeout_loop())
+
+    async def _timeout_loop(self) -> None:
+        try:
+            while self.active:
+                await asyncio.sleep(15)
+                if time.monotonic() - self.last_activity >= 300:
+                    await self.end("5분 동안 상호작용이 없어서 게임을 종료했어요.")
+                    return
+        except asyncio.CancelledError:
+            return
+
+    async def end(self, reason: str | None = None) -> None:
+        if not self.active:
+            return
+        self.active = False
+        if self.timeout_task and not self.timeout_task.done():
+            self.timeout_task.cancel()
+        channel_id = getattr(self.channel, "id", None)
+        if isinstance(channel_id, int):
+            self.cog.sessions.pop(channel_id, None)
+        if reason:
+            await self.channel.send(reason)
+
+    async def start_game(self) -> None:
+        raise NotImplementedError
+
+    async def handle_message(self, message: discord.Message) -> None:
+        self.touch()
+
+
+class GameRecruitView(discord.ui.View):
+    def __init__(self, session: BaseGameSession):
+        super().__init__(timeout=None)
+        self.session = session
+
+    @discord.ui.button(label="참여", style=discord.ButtonStyle.primary)
+    async def join_button(
+        self, interaction: discord.Interaction, _button: discord.ui.Button
+    ) -> None:
+        if self.session.join(interaction.user):
+            await interaction.response.send_message("참가자로 등록했어요.", ephemeral=True)
+            if self.session.recruit_message:
+                await self.session.recruit_message.edit(content=self.session.recruit_content(), view=self)
+        else:
+            await interaction.response.send_message("이미 시작된 게임이에요.", ephemeral=True)
+
+    @discord.ui.button(label="시작", style=discord.ButtonStyle.success)
+    async def start_button(
+        self, interaction: discord.Interaction, _button: discord.ui.Button
+    ) -> None:
+        if not self.session.can_control(interaction.user):
+            await interaction.response.send_message("방을 만든 사람이나 관리자만 시작할 수 있어요.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+        if self.session.recruit_message:
+            await self.session.recruit_message.edit(content=self.session.recruit_content(), view=self)
+        self.stop()
+        await self.session.start_game()
+
+    @discord.ui.button(label="취소", style=discord.ButtonStyle.danger)
+    async def cancel_button(
+        self, interaction: discord.Interaction, _button: discord.ui.Button
+    ) -> None:
+        if not self.session.can_control(interaction.user):
+            await interaction.response.send_message("방을 만든 사람이나 관리자만 취소할 수 있어요.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        self.stop()
+        await self.session.end("게임 모집을 취소했어요.")
+
+
+class WorldcupVoteView(discord.ui.View):
+    def __init__(self, session: "WorldcupSession"):
+        super().__init__(timeout=None)
+        self.session = session
+
+    @discord.ui.button(label="A", style=discord.ButtonStyle.primary)
+    async def vote_a(
+        self, interaction: discord.Interaction, _button: discord.ui.Button
+    ) -> None:
+        await self.session.vote(interaction, 0)
+
+    @discord.ui.button(label="B", style=discord.ButtonStyle.primary)
+    async def vote_b(
+        self, interaction: discord.Interaction, _button: discord.ui.Button
+    ) -> None:
+        await self.session.vote(interaction, 1)
+
+
+class WorldcupSession(BaseGameSession):
+    def __init__(
+        self,
+        cog: "PartyGames",
+        channel: discord.abc.Messageable,
+        owner: discord.Member | discord.User,
+        parsed: ParsedWorldcup,
+        rounds: int | None,
+    ):
+        super().__init__(cog, channel, owner, parsed.title)
+        self.all_items = parsed.items
+        self.rounds = rounds
+        self.current_round: list[GameItem] = []
+        self.next_round: list[GameItem] = []
+        self.match_index = 0
+        self.current_pair: tuple[GameItem, GameItem] | None = None
+        self.votes: dict[int, int] = {}
+        self.match_message: discord.Message | None = None
+
+    async def start_game(self) -> None:
+        self.started = True
+        self.touch()
+        power = 2 ** int(math.floor(math.log2(len(self.all_items))))
+        target = self.rounds or min(power, 32)
+        target = max(2, min(target, power))
+        target = 2 ** int(math.floor(math.log2(target)))
+        self.current_round = random.sample(self.all_items, target)
+        random.shuffle(self.current_round)
+        self.next_round = []
+        self.match_index = 0
+        self.start_timeout()
+        await self.channel.send(
+            f"**{self.title}** 월드컵을 시작해요. 참가자 {len(self.participants)}명, {target}강입니다."
+        )
+        await self.present_match()
+
+    async def present_match(self) -> None:
+        if not self.active:
+            return
+        if len(self.current_round) == 1:
+            champion = self.current_round[0]
+            await self.end(f"우승은 **{champion.name}**!")
+            return
+        if self.match_index >= len(self.current_round):
+            self.current_round = self.next_round
+            self.next_round = []
+            self.match_index = 0
+            await self.channel.send(f"다음 라운드로 넘어갑니다. **{len(self.current_round)}강**")
+            await self.present_match()
+            return
+
+        a = self.current_round[self.match_index]
+        b = self.current_round[self.match_index + 1]
+        self.current_pair = (a, b)
+        self.votes = {}
+        round_size = len(self.current_round)
+        match_no = self.match_index // 2 + 1
+        match_total = round_size // 2
+
+        embeds = [self.item_embed("A", a), self.item_embed("B", b)]
+        extra_links = []
+        for label, item in (("A", a), ("B", b)):
+            if item.media_url and item.media_type != "image":
+                extra_links.append(f"{label}: <{item.media_url}>")
+        content = (
+            f"**{round_size}강 {match_no}/{match_total}: A vs B**\n"
+            f"참가자 {len(self.participants)}명 전원이 투표하면 다음 대진으로 넘어가요."
+        )
+        if extra_links:
+            content += "\n" + "\n".join(extra_links)
+        self.match_message = await self.channel.send(
+            content=content,
+            embeds=embeds,
+            view=WorldcupVoteView(self),
+        )
+
+    def item_embed(self, label: str, item: GameItem) -> discord.Embed:
+        embed = discord.Embed(title=f"{label}. {item.name}")
+        if item.media_url and item.media_type == "image":
+            embed.set_image(url=item.media_url)
+        return embed
+
+    async def vote(self, interaction: discord.Interaction, choice: int) -> None:
+        if interaction.user.id not in self.participants:
+            await interaction.response.send_message("참가자만 투표할 수 있어요.", ephemeral=True)
+            return
+        if not self.current_pair:
+            await interaction.response.send_message("현재 진행 중인 대진이 없어요.", ephemeral=True)
+            return
+        self.votes[interaction.user.id] = choice
+        self.touch()
+        await interaction.response.send_message(
+            f"{'A' if choice == 0 else 'B'}에 투표했어요. ({len(self.votes)}/{len(self.participants)})",
+            ephemeral=True,
+        )
+        if len(self.votes) >= len(self.participants):
+            await self.resolve_match()
+
+    async def resolve_match(self) -> None:
+        if not self.current_pair:
+            return
+        a_votes = sum(1 for vote in self.votes.values() if vote == 0)
+        b_votes = sum(1 for vote in self.votes.values() if vote == 1)
+        winner = self.current_pair[0] if a_votes > b_votes else self.current_pair[1]
+        if a_votes == b_votes:
+            winner = random.choice(self.current_pair)
+        self.next_round.append(winner)
+        self.match_index += 2
+        if self.match_message:
+            try:
+                await self.match_message.edit(view=None)
+            except discord.HTTPException:
+                pass
+        await self.channel.send(
+            f"선택 결과 **{winner.name}** 승리! A {a_votes}표, B {b_votes}표"
+        )
+        await self.present_match()
+
+
+class QuizControlView(discord.ui.View):
+    def __init__(self, session: "QuizSession"):
+        super().__init__(timeout=None)
+        self.session = session
+
+    @discord.ui.button(label="스킵", style=discord.ButtonStyle.secondary)
+    async def skip_button(
+        self, interaction: discord.Interaction, _button: discord.ui.Button
+    ) -> None:
+        if not self.session.can_control(interaction.user):
+            await interaction.response.send_message("방을 만든 사람이나 관리자만 스킵할 수 있어요.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        await self.session.skip_question()
+
+    @discord.ui.button(label="종료", style=discord.ButtonStyle.danger)
+    async def end_button(
+        self, interaction: discord.Interaction, _button: discord.ui.Button
+    ) -> None:
+        if not self.session.can_control(interaction.user):
+            await interaction.response.send_message("방을 만든 사람이나 관리자만 종료할 수 있어요.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        await self.session.finish()
+
+
+class QuizSession(BaseGameSession):
+    def __init__(
+        self,
+        cog: "PartyGames",
+        channel: discord.abc.Messageable,
+        owner: discord.Member | discord.User,
+        parsed: ParsedQuiz,
+    ):
+        super().__init__(cog, channel, owner, parsed.title)
+        self.questions = parsed.questions
+        self.index = 0
+        self.scores: dict[int, int] = {}
+        self.normalized_answers: set[str] = set()
+
+    async def start_game(self) -> None:
+        self.started = True
+        self.touch()
+        random.shuffle(self.questions)
+        self.start_timeout()
+        await self.channel.send(
+            f"**{self.title}** 퀴즈를 시작해요. 참가자 {len(self.participants)}명, 총 {len(self.questions)}문제입니다."
+        )
+        await self.present_question()
+
+    async def present_question(self) -> None:
+        if self.index >= len(self.questions):
+            await self.finish()
+            return
+        question = self.questions[self.index]
+        self.normalized_answers = {
+            normalized for answer in question.answers if (normalized := normalize_answer(answer))
+        }
+        embed = discord.Embed(title=f"문제 {self.index + 1}/{len(self.questions)}")
+        if question.prompt and not question.prompt.startswith("문제 "):
+            embed.description = sanitize_discord_markdown(question.prompt)[:300]
+        content = "정답을 채팅으로 입력해 주세요."
+        view = QuizControlView(self)
+        if question.media_url and question.media_type == "image":
+            embed.set_image(url=question.media_url)
+        elif question.media_url:
+            segment = ""
+            if question.start_seconds is not None and question.end_seconds is not None:
+                segment = (
+                    f" ({format_timestamp(question.start_seconds)}"
+                    f"~{format_timestamp(question.end_seconds)})"
+                )
+            content = f"{content}\n문제 미디어{segment}: {question.media_url}"
+            view.add_item(
+                discord.ui.Button(
+                    label="문제 재생",
+                    style=discord.ButtonStyle.link,
+                    url=question.media_url,
+                )
+            )
+        await self.channel.send(content=content, embed=embed, view=view)
+
+    async def handle_message(self, message: discord.Message) -> None:
+        self.touch()
+        if not self.started or message.author.id not in self.participants:
+            return
+        answer = normalize_answer(message.content)
+        if not answer or answer not in self.normalized_answers:
+            return
+        self.scores[message.author.id] = self.scores.get(message.author.id, 0) + 1
+        question = self.questions[self.index]
+        await self.channel.send(
+            f"**{message.author.display_name}** 정답! 정답은 **{question.answers[0]}**"
+        )
+        self.index += 1
+        await self.present_question()
+
+    async def skip_question(self) -> None:
+        if self.index >= len(self.questions):
+            await self.finish()
+            return
+        question = self.questions[self.index]
+        await self.channel.send(f"문제를 넘겼어요. 정답은 **{question.answers[0]}**")
+        self.index += 1
+        self.touch()
+        await self.present_question()
+
+    async def finish(self) -> None:
+        if not self.active:
+            return
+        if not self.scores:
+            await self.end("퀴즈를 종료했어요. 아직 점수를 얻은 사람이 없어요.")
+            return
+        lines = []
+        for user_id, score in sorted(self.scores.items(), key=lambda item: item[1], reverse=True):
+            name = self.participants.get(user_id, str(user_id))
+            lines.append(f"- {name}: {score}점")
+        await self.end("퀴즈 종료!\n" + "\n".join(lines))
+
+
+class PartyGames(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        self.sessions: dict[int, BaseGameSession] = {}
+
+    def session_for_channel(self, channel: discord.abc.Messageable) -> BaseGameSession | None:
+        channel_id = getattr(channel, "id", None)
+        if not isinstance(channel_id, int):
+            return None
+        return self.sessions.get(channel_id)
+
+    async def register_session(
+        self, interaction: discord.Interaction, session: BaseGameSession
+    ) -> None:
+        channel = interaction.channel
+        channel_id = getattr(channel, "id", None)
+        if channel is None or not isinstance(channel_id, int):
+            await interaction.followup.send("이 명령어는 서버 채널에서만 사용할 수 있어요.", ephemeral=True)
+            return
+        if channel_id in self.sessions:
+            await interaction.followup.send("이 채널에서 이미 진행 중인 게임이 있어요.", ephemeral=True)
+            return
+        self.sessions[channel_id] = session
+        view = GameRecruitView(session)
+        session.start_timeout()
+        session.recruit_message = await channel.send(session.recruit_content(), view=view)
+        await interaction.followup.send("게임 모집을 열었어요.", ephemeral=True)
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message) -> None:
+        if message.author.bot:
+            return
+        session = self.session_for_channel(message.channel)
+        if session:
+            await session.handle_message(message)
+
+    @app_commands.command(
+        name="worldcup_export_script",
+        description="PIKU가 봇 접근을 막을 때 브라우저에서 후보 JSON을 뽑는 스크립트를 받습니다.",
+    )
+    async def worldcup_export_script(self, interaction: discord.Interaction) -> None:
+        script_file = discord.File(
+            io.BytesIO(PIKU_EXPORT_SCRIPT.encode("utf-8")),
+            filename="piku_export.js",
+        )
+        await interaction.response.send_message(
+            "PIKU가 봇 직접 접근을 막는 경우에는 이 파일의 내용을 PIKU 페이지 브라우저 콘솔에서 실행해 주세요.\n"
+            "다운로드된 `piku-worldcup.json`을 `/worldcup`의 `data` 옵션에 업로드하면 바로 진행할 수 있어요.\n"
+            "월드컵 시작 후 후보가 로드된 화면에서 실행하면 성공률이 가장 높습니다.",
+            file=script_file,
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="worldcup",
+        description="PIKU 이상형월드컵을 Discord 투표 게임으로 시작합니다.",
+    )
+    @app_commands.describe(
+        url="PIKU 월드컵 URL",
+        data="직접 파싱이 막힐 때 사용할 JSON fallback 파일",
+        rounds="진행할 강 수. 2의 거듭제곱으로 자동 보정됩니다.",
+    )
+    @app_commands.guild_only()
+    async def worldcup(
+        self,
+        interaction: discord.Interaction,
+        url: str | None = None,
+        data: discord.Attachment | None = None,
+        rounds: int | None = None,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+        if not url and data is None:
+            await interaction.followup.send("PIKU URL 또는 JSON fallback 파일이 필요해요.", ephemeral=True)
+            return
+        try:
+            parsed = parse_json_worldcup(await read_json_attachment(data)) if data else await parse_worldcup_from_url(url or "")
+        except GameParseError as exc:
+            message = str(exc)
+            if "PIKU" in message and "JSON fallback" in message:
+                message += (
+                    "\n`/worldcup_export_script`로 브라우저 추출 스크립트를 받아서 "
+                    "`piku-worldcup.json`을 자동 생성할 수 있어요."
+                )
+            await interaction.followup.send(message, ephemeral=True)
+            return
+        session = WorldcupSession(self, interaction.channel, interaction.user, parsed, rounds)
+        await self.register_session(interaction, session)
+
+    @app_commands.command(
+        name="quiz",
+        description="machugi.io 맞추기 퀴즈를 Discord 경쟁 게임으로 시작합니다.",
+    )
+    @app_commands.describe(
+        url="machugi.io 퀴즈 URL",
+        data="직접 파싱이 막힐 때 사용할 JSON fallback 파일",
+        count="가져올 문제 수. 최대 50개",
+    )
+    @app_commands.guild_only()
+    async def quiz(
+        self,
+        interaction: discord.Interaction,
+        url: str | None = None,
+        data: discord.Attachment | None = None,
+        count: app_commands.Range[int, 1, 50] = 10,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+        if not url and data is None:
+            await interaction.followup.send("machugi URL 또는 JSON fallback 파일이 필요해요.", ephemeral=True)
+            return
+        try:
+            parsed = parse_json_quiz(await read_json_attachment(data)) if data else await parse_machugi_from_url(url or "", int(count))
+        except GameParseError as exc:
+            await interaction.followup.send(str(exc), ephemeral=True)
+            return
+        session = QuizSession(self, interaction.channel, interaction.user, parsed)
+        await self.register_session(interaction, session)
 
 
 if voice_recv is not None:
@@ -1060,13 +3693,15 @@ class AI(commands.Cog):
         self.speaker = speaker
         self.voice_states: dict[int, VoiceConversationState] = {}
         self.voice_response_lock = asyncio.Lock()
+        self.voice_leave_votes: dict[int, set[int]] = {}
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot or message.guild is None:
             return
 
-        if message.content.strip():
+        mentioned = self.bot.user is not None and self.bot.user in message.mentions
+        if message.content.strip() and not mentioned:
             await self.store.add_message(
                 message.guild.id,
                 message.channel.id,
@@ -1077,30 +3712,47 @@ class AI(commands.Cog):
                 message.content,
             )
 
-        if self.bot.user is None or self.bot.user not in message.mentions:
+        if not mentioned:
             return
 
+        streamer: DiscordStreamEditor | None = None
         try:
+            if not await self.store.is_llm_enabled(message.guild.id):
+                await message.reply(
+                    "이 서버에서는 현재 LLM 기능이 꺼져 있어요. 서버 관리자가 `/llm_toggle`로 다시 켤 수 있습니다.",
+                    mention_author=False,
+                )
+                return
+
             content = self.strip_bot_mentions(message.content).strip()
             media_path = await self.first_supported_attachment(message)
             if not content:
                 content = "나를 멘션한 사용자에게 자연스럽게 응답해줘."
 
-            async with message.channel.typing():
-                answer = await self.conversation.answer(
-                    guild=message.guild,
-                    channel_id=message.channel.id,
-                    user=message.author,
-                    content=content,
-                    kind="direct",
-                    media_path=media_path,
-                )
+            response_message = await message.reply("생각 중...", mention_author=False)
+            streamer = DiscordStreamEditor(response_message)
+            answer = await self.conversation.answer(
+                guild=message.guild,
+                channel_id=message.channel.id,
+                user=message.author,
+                content=content,
+                kind="direct",
+                media_path=media_path,
+                is_admin=self.is_admin_user(message.author),
+                messageable=message.channel,
+                stream_callback=streamer.update,
+            )
         except AIError as exc:
-            await message.reply(str(exc), mention_author=False)
+            if streamer is not None:
+                await streamer.finish(str(exc))
+            else:
+                await message.reply(str(exc), mention_author=False)
             return
 
         if answer:
-            await message.reply(answer[:1900], mention_author=False)
+            await streamer.finish(answer)
+        else:
+            await streamer.finish("(응답 없음)")
 
     def strip_bot_mentions(self, content: str) -> str:
         if self.bot.user is None:
@@ -1109,6 +3761,33 @@ class AI(commands.Cog):
             content.replace(f"<@{self.bot.user.id}>", "")
             .replace(f"<@!{self.bot.user.id}>", "")
             .strip()
+        )
+
+    def is_admin_user(self, user: discord.abc.User) -> bool:
+        return bool(
+            getattr(getattr(user, "guild_permissions", None), "administrator", False)
+        )
+
+    def voice_voters_for(
+        self, voice_client: discord.VoiceClient
+    ) -> list[discord.Member]:
+        channel = getattr(voice_client, "channel", None)
+        if channel is None:
+            return []
+        return [member for member in channel.members if not member.bot]
+
+    def required_voice_votes(self, voice_client: discord.VoiceClient) -> int:
+        voters = self.voice_voters_for(voice_client)
+        return max(1, len(voters) // 2 + 1)
+
+    def user_in_bot_voice(self, interaction: discord.Interaction) -> bool:
+        voice_client = interaction.guild.voice_client if interaction.guild else None
+        user_voice = getattr(interaction.user, "voice", None)
+        return bool(
+            voice_client
+            and user_voice
+            and user_voice.channel
+            and user_voice.channel == voice_client.channel
         )
 
     async def first_supported_attachment(self, message: discord.Message) -> Path | None:
@@ -1147,24 +3826,58 @@ class AI(commands.Cog):
         )
         _stdout, stderr = await proc.communicate()
         if proc.returncode != 0:
-            raise AIError(f"오디오 첨부 파일을 WAV로 변환하지 못했어요: {stderr.decode(errors='ignore')[:300]}")
+            raise AIError(
+                f"오디오 첨부 파일을 WAV로 변환하지 못했어요: {stderr.decode(errors='ignore')[:300]}"
+            )
         return wav_path
 
-    @app_commands.command(name="context_reset", description="내 AI 대화 context와 장기 memory를 초기화합니다.")
+    @app_commands.command(
+        name="context_reset",
+        description="내 AI 대화 context와 장기 memory를 초기화합니다.",
+    )
     @app_commands.guild_only()
     async def context_reset(self, interaction: discord.Interaction) -> None:
         await self.store.reset_user(interaction.guild.id, interaction.user.id)
-        await send_interaction(interaction, "내 대화 context와 장기 memory를 초기화했어요.", ephemeral=True)
+        await send_interaction(
+            interaction, "내 대화 context와 장기 memory를 초기화했어요.", ephemeral=True
+        )
 
-    @app_commands.command(name="server_context_reset", description="서버 공유 context를 초기화합니다. 관리자 전용.")
+    @app_commands.command(
+        name="server_context_reset",
+        description="서버 공유 context를 초기화합니다. 관리자 전용.",
+    )
     @app_commands.checks.has_permissions(administrator=True)
     @app_commands.guild_only()
     async def server_context_reset(self, interaction: discord.Interaction) -> None:
         await self.store.reset_guild(interaction.guild.id)
-        await send_interaction(interaction, "서버 공유 context를 초기화했어요.", ephemeral=True)
+        await send_interaction(
+            interaction, "서버 공유 context를 초기화했어요.", ephemeral=True
+        )
 
-    @app_commands.command(name="voice_join", description="음성 채널에 들어가 말로 대화합니다.")
-    @app_commands.describe(always_reply="켜면 들은 말마다 답하고, 끄면 봇에게 한 말일 때만 답하려고 시도합니다.")
+    @app_commands.command(
+        name="llm_toggle",
+        description="이 서버의 LLM 멘션/음성 응답을 켜거나 끕니다. 관리자 전용.",
+    )
+    @app_commands.describe(enabled="true면 켜고 false면 끕니다.")
+    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.guild_only()
+    async def llm_toggle(
+        self, interaction: discord.Interaction, enabled: bool
+    ) -> None:
+        await self.store.set_llm_enabled(interaction.guild.id, enabled)
+        state = "켰어요" if enabled else "껐어요"
+        await send_interaction(
+            interaction,
+            f"LLM 멘션/음성 응답을 {state}. 음악 slash command와 TTS 명령은 그대로 사용할 수 있어요.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="voice_join", description="음성 채널에 들어가 말로 대화합니다."
+    )
+    @app_commands.describe(
+        always_reply="켜면 들은 말마다 답하고, 끄면 봇에게 한 말일 때만 답하려고 시도합니다."
+    )
     @app_commands.guild_only()
     async def voice_join(
         self, interaction: discord.Interaction, always_reply: bool = True
@@ -1179,20 +3892,27 @@ class AI(commands.Cog):
 
         voice_state = getattr(interaction.user, "voice", None)
         if voice_state is None or voice_state.channel is None:
-            await send_interaction(interaction, "먼저 음성 채널에 들어가 주세요.", ephemeral=True)
+            await send_interaction(
+                interaction, "먼저 음성 채널에 들어가 주세요.", ephemeral=True
+            )
             return
 
         voice_client = interaction.guild.voice_client
-        if voice_client is not None and not isinstance(voice_client, voice_recv.VoiceRecvClient):
+        if voice_client is not None and not isinstance(
+            voice_client, voice_recv.VoiceRecvClient
+        ):
             await voice_client.disconnect(force=True)
             voice_client = None
 
         if voice_client is None:
-            voice_client = await voice_state.channel.connect(cls=voice_recv.VoiceRecvClient)
+            voice_client = await voice_state.channel.connect(
+                cls=voice_recv.VoiceRecvClient
+            )
         elif voice_client.channel != voice_state.channel:
             await voice_client.move_to(voice_state.channel)
 
         old_state = self.voice_states.pop(interaction.guild.id, None)
+        self.voice_leave_votes.pop(interaction.guild.id, None)
         if old_state:
             old_state.monitor_task.cancel()
             if voice_client.is_listening():
@@ -1207,23 +3927,151 @@ class AI(commands.Cog):
             always_reply=always_reply,
         )
         voice_client.listen(sink)
-        await send_interaction(interaction, "음성 대화를 시작했어요. 이제 말로 대화할 수 있어요.")
+        await send_interaction(
+            interaction, "음성 대화를 시작했어요. 이제 말로 대화할 수 있어요."
+        )
 
-    @app_commands.command(name="voice_leave", description="음성 대화를 종료하고 채널에서 나갑니다.")
+    @app_commands.command(
+        name="voice_leave", description="음성 대화를 종료하고 채널에서 나갑니다."
+    )
     @app_commands.guild_only()
     async def voice_leave(self, interaction: discord.Interaction) -> None:
-        state = self.voice_states.pop(interaction.guild.id, None)
+        voice_client = interaction.guild.voice_client
+        if not voice_client or not voice_client.is_connected():
+            await send_interaction(
+                interaction, "봇이 음성 채널에 연결되어 있지 않아요."
+            )
+            return
+
+        if self.is_admin_user(interaction.user):
+            await self.disconnect_voice_conversation(interaction.guild)
+            await send_interaction(
+                interaction, "관리자 권한으로 음성 대화를 종료하고 나갔어요."
+            )
+            return
+
+        if not self.user_in_bot_voice(interaction):
+            await send_interaction(
+                interaction,
+                "같은 음성 채널에 있는 사람만 voice_leave 투표를 할 수 있어요.",
+                ephemeral=True,
+            )
+            return
+
+        voters = self.voice_voters_for(voice_client)
+        required = self.required_voice_votes(voice_client)
+        votes = self.voice_leave_votes.setdefault(interaction.guild.id, set())
+        votes.add(interaction.user.id)
+        votes.intersection_update({member.id for member in voters})
+
+        if len(votes) >= required:
+            self.voice_leave_votes.pop(interaction.guild.id, None)
+            await self.disconnect_voice_conversation(interaction.guild)
+            await send_interaction(
+                interaction,
+                f"voice_leave 투표가 과반수에 도달했어요. ({required}/{len(voters)}, 봇 제외 기준) 음성 대화를 종료하고 나갑니다.",
+            )
+            return
+
+        await send_interaction(
+            interaction,
+            f"voice_leave 투표를 기록했어요. ({len(votes)}/{required}, 봇 제외 {len(voters)}명 기준)",
+        )
+
+    async def disconnect_voice_conversation(self, guild: discord.Guild) -> None:
+        state = self.voice_states.pop(guild.id, None)
         if state:
             state.monitor_task.cancel()
+        self.voice_leave_votes.pop(guild.id, None)
 
-        voice_client = interaction.guild.voice_client
+        voice_client = guild.voice_client
         if voice_client and voice_client.is_connected():
             await voice_client.disconnect(force=True)
-            await send_interaction(interaction, "음성 대화를 종료하고 나갔어요.")
-            return
-        await send_interaction(interaction, "봇이 음성 채널에 연결되어 있지 않아요.")
 
-    @app_commands.command(name="voice_style", description="TTS 기본 음성과 언어를 설정합니다. 관리자 전용.")
+    @app_commands.command(
+        name="tts_message",
+        description="설정된 TTS 음성으로 음성 파일 메시지를 보냅니다.",
+    )
+    @app_commands.describe(
+        text="음성으로 만들 텍스트",
+        play_in_voice="내 음성 채널에서도 같이 재생할지 여부",
+    )
+    @app_commands.guild_only()
+    async def tts_message(
+        self,
+        interaction: discord.Interaction,
+        text: str,
+        play_in_voice: bool = False,
+    ) -> None:
+        await interaction.response.defer()
+        try:
+            audio_path = await self.speaker.synthesize(interaction.guild.id, text)
+        except Exception as exc:
+            await interaction.followup.send(f"TTS 생성에 실패했어요: {exc}")
+            return
+
+        await interaction.followup.send(
+            content="설정된 TTS로 만든 음성 메시지예요.",
+            file=discord.File(audio_path, filename="tts_message.wav"),
+        )
+
+        if play_in_voice:
+            await self.play_tts_file_for_interaction(interaction, audio_path)
+
+    async def play_tts_file_for_interaction(
+        self, interaction: discord.Interaction, audio_path: Path
+    ) -> None:
+        voice_state = getattr(interaction.user, "voice", None)
+        if voice_state is None or voice_state.channel is None:
+            await interaction.followup.send(
+                "음성 채널 재생을 하려면 먼저 음성 채널에 들어가 주세요.",
+                ephemeral=True,
+            )
+            return
+
+        voice_client = interaction.guild.voice_client
+        if voice_client is None:
+            if voice_recv is not None:
+                voice_client = await voice_state.channel.connect(
+                    cls=voice_recv.VoiceRecvClient
+                )
+            else:
+                voice_client = await voice_state.channel.connect()
+        elif voice_client.channel != voice_state.channel:
+            await voice_client.move_to(voice_state.channel)
+
+        if voice_client.is_playing() or voice_client.is_paused():
+            await interaction.followup.send(
+                "현재 오디오가 재생 중이라 음성 채널 재생은 건너뛰었어요.",
+                ephemeral=True,
+            )
+            return
+
+        done = asyncio.Event()
+
+        def after_play(error: Exception | None) -> None:
+            if error:
+                asyncio.run_coroutine_threadsafe(
+                    interaction.followup.send(
+                        f"TTS 재생 중 오류가 발생했어요: {error}"
+                    ),
+                    self.bot.loop,
+                )
+            self.bot.loop.call_soon_threadsafe(done.set)
+
+        voice_client.play(discord.FFmpegPCMAudio(str(audio_path)), after=after_play)
+        try:
+            await asyncio.wait_for(done.wait(), timeout=180)
+        except asyncio.TimeoutError:
+            if hasattr(voice_client, "stop_playing"):
+                voice_client.stop_playing()
+            else:
+                voice_client.stop()
+
+    @app_commands.command(
+        name="voice_style",
+        description="TTS 기본 음성과 언어를 설정합니다. 관리자 전용.",
+    )
     @app_commands.describe(voice_name="M1-M5 또는 F1-F5", lang="언어 코드. 한국어는 ko")
     @app_commands.checks.has_permissions(administrator=True)
     @app_commands.guild_only()
@@ -1238,16 +4086,25 @@ class AI(commands.Cog):
         try:
             await self.speaker.validate_builtin_voice(voice_name)
         except Exception as exc:
-            await interaction.followup.send(f"해당 음성을 불러오지 못했어요: {exc}", ephemeral=True)
+            await interaction.followup.send(
+                f"해당 음성을 불러오지 못했어요: {exc}", ephemeral=True
+            )
             return
 
         await self.store.set_voice_settings(
             interaction.guild.id, voice_name=voice_name, voice_style_path="", lang=lang
         )
-        await interaction.followup.send(f"TTS 음성을 {voice_name}, 언어를 {lang}로 설정했어요.", ephemeral=True)
+        await interaction.followup.send(
+            f"TTS 음성을 {voice_name}, 언어를 {lang}로 설정했어요.", ephemeral=True
+        )
 
-    @app_commands.command(name="voice_refer", description="Supertonic voice style JSON을 적용합니다. 관리자 전용.")
-    @app_commands.describe(refer="Voice Builder JSON 또는 로컬 변환기에 넣을 reference audio")
+    @app_commands.command(
+        name="voice_refer",
+        description="Supertonic voice style JSON을 적용합니다. 관리자 전용.",
+    )
+    @app_commands.describe(
+        refer="Voice Builder JSON 또는 로컬 변환기에 넣을 reference audio"
+    )
     @app_commands.checks.has_permissions(administrator=True)
     @app_commands.guild_only()
     async def voice_refer(
@@ -1264,17 +4121,23 @@ class AI(commands.Cog):
             try:
                 await self.speaker.validate_voice_style(saved_path)
             except Exception as exc:
-                await interaction.followup.send(f"voice style JSON을 읽지 못했어요: {exc}", ephemeral=True)
+                await interaction.followup.send(
+                    f"voice style JSON을 읽지 못했어요: {exc}", ephemeral=True
+                )
                 return
 
             await self.store.set_voice_settings(
                 interaction.guild.id, voice_style_path=str(saved_path)
             )
-            await interaction.followup.send("업로드한 Supertonic voice style JSON을 적용했어요.", ephemeral=True)
+            await interaction.followup.send(
+                "업로드한 Supertonic voice style JSON을 적용했어요.", ephemeral=True
+            )
             return
 
         if suffix not in {".wav", ".mp3", ".m4a", ".ogg", ".flac"}:
-            await interaction.followup.send("JSON 또는 오디오 파일만 업로드할 수 있어요.", ephemeral=True)
+            await interaction.followup.send(
+                "JSON 또는 오디오 파일만 업로드할 수 있어요.", ephemeral=True
+            )
             return
 
         if not SUPERTONIC_VOICE_BUILDER_CMD:
@@ -1305,11 +4168,17 @@ class AI(commands.Cog):
         try:
             await self.speaker.validate_voice_style(output_json)
         except Exception as exc:
-            await interaction.followup.send(f"변환된 voice style JSON을 읽지 못했어요: {exc}", ephemeral=True)
+            await interaction.followup.send(
+                f"변환된 voice style JSON을 읽지 못했어요: {exc}", ephemeral=True
+            )
             return
 
-        await self.store.set_voice_settings(interaction.guild.id, voice_style_path=str(output_json))
-        await interaction.followup.send("reference audio로 만든 voice style을 적용했어요.", ephemeral=True)
+        await self.store.set_voice_settings(
+            interaction.guild.id, voice_style_path=str(output_json)
+        )
+        await interaction.followup.send(
+            "reference audio로 만든 voice style을 적용했어요.", ephemeral=True
+        )
 
     async def monitor_voice(self, guild_id: int) -> None:
         try:
@@ -1318,11 +4187,15 @@ class AI(commands.Cog):
                 state = self.voice_states.get(guild_id)
                 if state is None:
                     return
-                for user, pcm in state.sink.pop_ready(VOICE_SILENCE_SECONDS, VOICE_MIN_BYTES):
+                for user, pcm in state.sink.pop_ready(
+                    VOICE_SILENCE_SECONDS, VOICE_MIN_BYTES
+                ):
                     if user.id in state.processing_users:
                         continue
                     state.processing_users.add(user.id)
-                    asyncio.create_task(self.handle_voice_utterance(guild_id, user, pcm))
+                    asyncio.create_task(
+                        self.handle_voice_utterance(guild_id, user, pcm)
+                    )
         except asyncio.CancelledError:
             return
 
@@ -1336,11 +4209,17 @@ class AI(commands.Cog):
 
         audio_dir = DATA_DIR / "voice_inputs"
         audio_dir.mkdir(parents=True, exist_ok=True)
-        audio_path = audio_dir / f"voice_{guild_id}_{user.id}_{int(time.time() * 1000)}.wav"
+        audio_path = (
+            audio_dir / f"voice_{guild_id}_{user.id}_{int(time.time() * 1000)}.wav"
+        )
         self.write_pcm_wav(audio_path, pcm)
 
         channel = guild.get_channel(state.text_channel_id)
         try:
+            if not await self.store.is_llm_enabled(guild_id):
+                if channel is not None:
+                    await channel.send("LLM 기능이 꺼져 있어 음성 응답을 건너뛰었어요.")
+                return
             async with self.voice_response_lock:
                 answer = await self.conversation.answer(
                     guild=guild,
@@ -1350,6 +4229,8 @@ class AI(commands.Cog):
                     kind="voice",
                     media_path=audio_path,
                     always_reply=state.always_reply,
+                    is_admin=self.is_admin_user(user),
+                    messageable=channel,
                 )
                 if not answer:
                     return
@@ -1382,7 +4263,9 @@ class AI(commands.Cog):
             return
         if voice_client.is_playing() or voice_client.is_paused():
             if channel is not None:
-                await channel.send("현재 오디오가 재생 중이라 TTS 음성 출력은 건너뛰었어요.")
+                await channel.send(
+                    "현재 오디오가 재생 중이라 TTS 음성 출력은 건너뛰었어요."
+                )
             return
 
         try:
@@ -1397,7 +4280,8 @@ class AI(commands.Cog):
         def after_play(error: Exception | None) -> None:
             if error and channel is not None:
                 asyncio.run_coroutine_threadsafe(
-                    channel.send(f"TTS 재생 중 오류가 발생했어요: {error}"), self.bot.loop
+                    channel.send(f"TTS 재생 중 오류가 발생했어요: {error}"),
+                    self.bot.loop,
                 )
             self.bot.loop.call_soon_threadsafe(done.set)
 
@@ -1423,10 +4307,36 @@ bot = commands.Bot(
 bot.synced_commands = False
 
 memory_store = MemoryStore(MEMORY_DB_PATH)
-ollama_client = OllamaClient(OLLAMA_URL, OLLAMA_MODEL, OLLAMA_TIMEOUT)
+primary_llm_client = LLMClient(
+    LLM_BACKEND,
+    LLM_URL,
+    LLM_MODEL,
+    LLM_TIMEOUT,
+    api_key=LLM_API_KEY,
+    max_tokens=LLM_MAX_TOKENS,
+)
+fallback_llm_client = (
+    LLMClient(
+        LLM_FALLBACK_BACKEND,
+        LLM_FALLBACK_URL,
+        LLM_FALLBACK_MODEL,
+        LLM_FALLBACK_TIMEOUT,
+        max_tokens=LLM_MAX_TOKENS,
+    )
+    if LLM_FALLBACK_ENABLED
+    else None
+)
+llm_client = FallbackLLMClient(primary_llm_client, fallback_llm_client)
 web_search_client = WebSearchClient(WEB_SEARCH_ENABLED, WEB_SEARCH_MAX_RESULTS)
+tool_registry = ToolRegistry()
+tool_registry.register(AskUserTool())
+if WEB_SEARCH_ENABLED:
+    tool_registry.register(WebSearchTool(web_search_client))
+tool_registry.register(DiscordContextTool())
+tool_registry.register(MusicQueueTool())
+tool_registry.register(MusicRecommendTool())
 conversation_service = AIConversationService(
-    memory_store, ollama_client, web_search_client
+    bot, memory_store, llm_client, tool_registry
 )
 supertonic_speaker = SupertonicSpeaker(memory_store)
 
@@ -1452,9 +4362,13 @@ async def on_app_command_error(
     interaction: discord.Interaction, error: app_commands.AppCommandError
 ) -> None:
     if isinstance(error, app_commands.MissingPermissions):
-        await send_interaction(interaction, "이 명령어는 서버 관리자만 사용할 수 있어요.", ephemeral=True)
+        await send_interaction(
+            interaction, "이 명령어는 서버 관리자만 사용할 수 있어요.", ephemeral=True
+        )
         return
-    await send_interaction(interaction, f"명령어 처리 중 오류가 발생했어요: {error}", ephemeral=True)
+    await send_interaction(
+        interaction, f"명령어 처리 중 오류가 발생했어요: {error}", ephemeral=True
+    )
 
 
 async def handle_health_check(
@@ -1471,8 +4385,7 @@ async def handle_health_check(
         b"Content-Type: text/plain\r\n"
         b"Content-Length: 2\r\n"
         b"Connection: close\r\n"
-        b"\r\n"
-        + body
+        b"\r\n" + body
     )
     await writer.drain()
     writer.close()
@@ -1501,6 +4414,7 @@ async def main() -> None:
     try:
         async with bot:
             await bot.add_cog(Music(bot))
+            await bot.add_cog(PartyGames(bot))
             await bot.add_cog(
                 AI(bot, memory_store, conversation_service, supertonic_speaker)
             )
