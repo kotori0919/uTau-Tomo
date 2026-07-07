@@ -92,9 +92,9 @@ SUPERTONIC_MAX_CHARS=700
 - `/tts_message text play_in_voice`: generate a WAV voice message with the configured TTS voice. Optionally also play it in your voice channel.
 - `/voice_style voice_name lang`: set built-in Supertonic voice and language. Administrator only.
 - `/voice_refer refer`: apply a Supertonic voice style JSON, or run an optional reference-audio-to-JSON converter. Administrator only.
-- `/worldcup url data rounds`: start a PIKU-style ideal type worldcup in the current channel. Users join with a button, then every joined participant votes on each `n강 A vs B` match. Channel chat counts as activity while the game is running, so discussion does not trigger the 5-minute timeout.
+- `/worldcup url data rounds`: start a PIKU-style ideal type worldcup in the current channel. Users join with a button, then every joined participant must agree to start. During matches, every joined participant votes on each `n강 A vs B` match. Channel chat counts as activity while the game is running, so discussion does not trigger the 5-minute timeout.
 - `/worldcup_export_script`: get a browser-side export script for PIKU pages that block direct bot access.
-- `/quiz url data count`: start a machugi.io competitive quiz in the current channel. Users join with a button, then answer in chat. The first participant to type an accepted answer gets the point.
+- `/quiz url data count`: start a machugi.io competitive quiz in the current channel. `count=0` uses the largest question count offered by the page. Users join with a button, every joined participant must agree to start, then answers are accepted in chat. The first participant to type an accepted answer gets the point.
 
 ## Party Games
 
@@ -132,7 +132,7 @@ Quiz fallback JSON:
 }
 ```
 
-Only one party game can run in a channel at a time. If there is no interaction for 5 minutes, the game ends automatically.
+Only one party game can run in a channel at a time. Quiz skips require every joined participant to agree. If there is no interaction for 5 minutes, the game ends automatically.
 
 ## Mention Chat
 

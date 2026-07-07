@@ -713,7 +713,7 @@ def parse_json_quiz(data: dict[str, object]) -> ParsedQuiz:
     return ParsedQuiz(title=title, questions=questions)
 
 
-PIKU_EXPORT_SCRIPT = r"""(() => {
+PIKU_EXPORT_SCRIPT = r"""(async () => {
   const title =
     document.querySelector("h1,h2,h3,h4")?.innerText?.trim() ||
     document.title.replace(/\s*-\s*PIKU.*$/i, "").trim() ||
@@ -801,15 +801,47 @@ PIKU_EXPORT_SCRIPT = r"""(() => {
     }
   };
 
-  document.querySelectorAll("img,video,source").forEach((element) => {
-    const url = element.currentSrc || element.src || element.getAttribute("src") || element.getAttribute("data-src");
+  const cssUrls = (value) => {
+    const urls = [];
+    if (!value || value === "none") return urls;
+    for (const match of value.matchAll(/url\((['"]?)(.*?)\1\)/g)) {
+      if (match[2]) urls.push(match[2]);
+    }
+    return urls;
+  };
+  const elementText = (element) =>
+    element.getAttribute("alt") ||
+    element.getAttribute("title") ||
+    element.getAttribute("aria-label") ||
+    element.closest("[title]")?.getAttribute("title") ||
+    element.querySelector?.("[id$='n'],.name,.title")?.innerText ||
+    element.closest("a,li,tr,div")?.innerText?.split("\n").map((line) => line.trim()).find(Boolean);
+  const scanElement = (element) => {
     const text =
-      element.getAttribute("alt") ||
-      element.getAttribute("title") ||
-      element.closest("[title]")?.getAttribute("title") ||
-      element.closest("a,li,div")?.innerText?.split("\n").map((line) => line.trim()).find(Boolean);
-    addItem(text, url);
-  });
+      element.id === "wleft" ? document.querySelector("#wleftn")?.innerText :
+      element.id === "wright" ? document.querySelector("#wrightn")?.innerText :
+      elementText(element);
+    const urls = [
+      element.currentSrc,
+      element.src,
+      element.href,
+      element.getAttribute("src"),
+      element.getAttribute("data-src"),
+      element.getAttribute("data-original"),
+      element.getAttribute("data-url"),
+      element.getAttribute("data-image"),
+      element.getAttribute("poster"),
+      ...cssUrls(element.getAttribute("style") || ""),
+      ...cssUrls(getComputedStyle(element).backgroundImage),
+    ];
+    for (const attr of element.getAttributeNames?.() || []) {
+      const value = element.getAttribute(attr);
+      if (typeof value === "string" && looksMedia(value)) urls.push(value);
+    }
+    for (const url of urls) addItem(text, url);
+  };
+
+  document.querySelectorAll("*").forEach(scanElement);
 
   for (const key of ["__NEXT_DATA__", "__NUXT__", "__INITIAL_STATE__", "__APOLLO_STATE__", "__REDUX_STATE__"]) {
     try { visit(window[key], 0); } catch {}
@@ -823,9 +855,88 @@ PIKU_EXPORT_SCRIPT = r"""(() => {
     }
   }
 
-  const output = { title, items: Array.from(items.values()) };
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const visible = (element) => {
+    if (!element) return false;
+    const style = getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return style.display !== "none" && style.visibility !== "hidden" && rect.width > 10 && rect.height > 10;
+  };
+  const rescan = () => {
+    document.querySelectorAll("*").forEach(scanElement);
+    for (const key of ["__NEXT_DATA__", "__NUXT__", "__INITIAL_STATE__", "__APOLLO_STATE__", "__REDUX_STATE__"]) {
+      try { visit(window[key], 0); } catch {}
+    }
+    try { scanStorage(localStorage); } catch {}
+    try { scanStorage(sessionStorage); } catch {}
+  };
+  const detectedRound = (() => {
+    const texts = [
+      document.querySelector("#selRound")?.value,
+      document.querySelector("#rtext")?.innerText,
+      document.querySelector("#round")?.innerText,
+      document.body.innerText,
+    ].filter(Boolean).join("\n");
+    const matches = Array.from(texts.matchAll(/(\d+)\s*강/g)).map((match) => Number(match[1]));
+    return matches.find((value) => Number.isFinite(value) && value >= 2) || 32;
+  })();
+  const desiredText = prompt(
+    "몇 명까지 자동 수집할까요? 현재 진행할 라운드 인원 수를 입력하세요.",
+    String(detectedRound)
+  );
+  const desiredCount = Math.max(2, Math.min(2048, Number.parseInt(desiredText || detectedRound, 10) || detectedRound));
+
+  const startButton = document.querySelector("#rstart");
+  if (startButton && visible(startButton) && !visible(document.querySelector("#wleft"))) {
+    startButton.click();
+    await sleep(2000);
+  }
+
+  let attempts = 0;
+  let idleAttempts = 0;
+  let previousCount = -1;
+  const maxAttempts = desiredCount + 20;
+  while (items.size < desiredCount && attempts < maxAttempts) {
+    attempts++;
+    rescan();
+    if (items.size === previousCount) idleAttempts++;
+    else idleAttempts = 0;
+    previousCount = items.size;
+
+    const left = document.querySelector("#wleft");
+    const right = document.querySelector("#wright");
+    if (!visible(left) || !visible(right)) {
+      if (idleAttempts > 3) break;
+      await sleep(700);
+      continue;
+    }
+
+    const winner = Math.random() < 0.5 ? left : right;
+    winner.click();
+    await sleep(850);
+  }
+  rescan();
+
+  const output = { title, items: Array.from(items.values()).slice(0, desiredCount) };
   const json = JSON.stringify(output, null, 2);
   console.log(`PIKU export: ${output.items.length} items`, output);
+  if (output.items.length < 2) {
+    alert("후보를 찾지 못했어요. PIKU에서 '시작하기'를 눌러 A vs B 대진 화면이 보이는 상태에서 다시 실행해 주세요. 콘솔에 진단 정보가 출력됐어요.");
+    console.log("PIKU export diagnostic", {
+      url: location.href,
+      text: document.body.innerText.slice(0, 1000),
+      ids: Array.from(document.querySelectorAll("[id]")).map((el) => ({
+        id: el.id,
+        text: el.innerText?.slice(0, 120),
+        style: el.getAttribute("style"),
+        bg: getComputedStyle(el).backgroundImage,
+      })).slice(0, 80),
+    });
+    return;
+  }
+  if (output.items.length < desiredCount) {
+    alert(`${desiredCount}명 중 ${output.items.length}명만 수집했어요. 그래도 JSON을 다운로드합니다. 더 많이 필요하면 PIKU에서 더 큰 라운드를 선택하고 A vs B 화면에서 다시 실행해 주세요.`);
+  }
   if (navigator.clipboard?.writeText) {
     navigator.clipboard.writeText(json).catch(() => {});
   }
@@ -837,6 +948,201 @@ PIKU_EXPORT_SCRIPT = r"""(() => {
   setTimeout(() => URL.revokeObjectURL(link.href), 1000);
   alert(`${output.items.length}개 후보를 추출했어요. piku-worldcup.json을 /worldcup data에 업로드해 주세요.`);
 })();"""
+
+
+PIKU_BROWSER_EXTRACT_SCRIPT = r"""() => {
+  const title =
+    document.querySelector("h1,h2,h3,h4")?.innerText?.trim() ||
+    document.title.replace(/\s*-\s*PIKU.*$/i, "").trim() ||
+    "PIKU Worldcup";
+  const nameKeys = ["name", "title", "text", "label", "subject", "content", "displayName", "answer"];
+  const urlKeys = [
+    "media_url", "mediaUrl", "image_url", "imageUrl", "imgUrl", "img_url",
+    "image", "img", "src", "url", "fileUrl", "file_url", "thumbnailUrl",
+    "thumbnail_url", "videoUrl", "video_url"
+  ];
+  const items = new Map();
+  const seen = new WeakSet();
+  let objectCount = 0;
+
+  const abs = (value) => {
+    if (typeof value !== "string" || !value.trim()) return null;
+    if (value.startsWith("data:") || value.startsWith("blob:")) return null;
+    try { return new URL(value, location.href).href; } catch { return null; }
+  };
+  const looksMedia = (value) =>
+    /\.(?:png|jpe?g|gif|webp|avif|mp4|webm|mov)(?:[?#].*)?$/i.test(value) ||
+    /(?:piku|cloudfront|cloudflare|googleusercontent|youtube|ytimg|cdn|image|img|media)/i.test(value);
+  const addItem = (name, url) => {
+    name = String(name || "").replace(/\s+/g, " ").trim();
+    url = abs(url);
+    if (!name || !url || name.length > 160 || !looksMedia(url)) return;
+    items.set(`${name}\n${url}`, { name, media_url: url });
+  };
+  const pickText = (value) =>
+    typeof value === "string" && value.trim() && value.length <= 160 ? value.trim() : null;
+  const inspectObject = (obj) => {
+    if (!obj || typeof obj !== "object") return;
+    let name = null;
+    let url = null;
+    for (const key of nameKeys) {
+      if (name = pickText(obj[key])) break;
+    }
+    for (const key of urlKeys) {
+      const candidate = obj[key];
+      if (typeof candidate === "string" && (url = abs(candidate))) break;
+    }
+    if (name && url) addItem(name, url);
+  };
+  const visit = (value, depth = 0) => {
+    if (!value || typeof value !== "object" || depth > 7 || objectCount > 30000 || seen.has(value)) return;
+    seen.add(value);
+    objectCount++;
+    inspectObject(value);
+    if (Array.isArray(value)) {
+      for (const child of value) visit(child, depth + 1);
+      return;
+    }
+    for (const key of Object.keys(value)) {
+      try {
+        const child = value[key];
+        if (typeof child === "object") visit(child, depth + 1);
+      } catch {}
+    }
+  };
+  const scanStorage = (storage) => {
+    for (let index = 0; index < storage.length; index++) {
+      const key = storage.key(index);
+      try {
+        const raw = storage.getItem(key);
+        if (!raw || raw.length > 3000000) continue;
+        if (/^\s*[\[{]/.test(raw)) visit(JSON.parse(raw), 0);
+      } catch {}
+    }
+  };
+
+  const cssUrls = (value) => {
+    const urls = [];
+    if (!value || value === "none") return urls;
+    for (const match of value.matchAll(/url\((['"]?)(.*?)\1\)/g)) {
+      if (match[2]) urls.push(match[2]);
+    }
+    return urls;
+  };
+  const elementText = (element) =>
+    element.getAttribute("alt") ||
+    element.getAttribute("title") ||
+    element.getAttribute("aria-label") ||
+    element.closest("[title]")?.getAttribute("title") ||
+    element.querySelector?.("[id$='n'],.name,.title")?.innerText ||
+    element.closest("a,li,tr,div")?.innerText?.split("\n").map((line) => line.trim()).find(Boolean);
+  const scanElement = (element) => {
+    const text =
+      element.id === "wleft" ? document.querySelector("#wleftn")?.innerText :
+      element.id === "wright" ? document.querySelector("#wrightn")?.innerText :
+      elementText(element);
+    const urls = [
+      element.currentSrc,
+      element.src,
+      element.href,
+      element.getAttribute("src"),
+      element.getAttribute("data-src"),
+      element.getAttribute("data-original"),
+      element.getAttribute("data-url"),
+      element.getAttribute("data-image"),
+      element.getAttribute("poster"),
+      ...cssUrls(element.getAttribute("style") || ""),
+      ...cssUrls(getComputedStyle(element).backgroundImage),
+    ];
+    for (const attr of element.getAttributeNames?.() || []) {
+      const value = element.getAttribute(attr);
+      if (typeof value === "string" && looksMedia(value)) urls.push(value);
+    }
+    for (const url of urls) addItem(text, url);
+  };
+
+  document.querySelectorAll("*").forEach(scanElement);
+  for (const key of ["__NEXT_DATA__", "__NUXT__", "__INITIAL_STATE__", "__APOLLO_STATE__", "__REDUX_STATE__"]) {
+    try { visit(window[key], 0); } catch {}
+  }
+  try { scanStorage(localStorage); } catch {}
+  try { scanStorage(sessionStorage); } catch {}
+  for (const key of Object.getOwnPropertyNames(window)) {
+    if (/^(?:webpack|__|app|vue|react|pinia|world|cup|piku)/i.test(key)) {
+      try { visit(window[key], 0); } catch {}
+    }
+  }
+  return { title, items: Array.from(items.values()), url: location.href, text: document.body.innerText.slice(0, 500) };
+}"""
+
+
+async def parse_worldcup_with_browser(url: str, rounds: int | None = None) -> ParsedWorldcup:
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError as exc:
+        raise GameParseError(
+            "PIKU 서버 브라우저 자동화를 사용하려면 `pip install playwright`와 "
+            "`python -m playwright install chromium`이 필요해요."
+        ) from exc
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+            ],
+        )
+        try:
+            context = await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1365, "height": 768},
+                locale="ko-KR",
+                timezone_id="Asia/Seoul",
+            )
+            await context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+            )
+            page = await context.new_page()
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(2500)
+
+            if rounds is not None:
+                try:
+                    await page.locator("#selRound").select_option(str(rounds), timeout=3000)
+                except Exception:
+                    pass
+
+            if await page.locator("#rstart").count():
+                try:
+                    await page.locator("#rstart").click(timeout=5000, force=True)
+                    await page.wait_for_timeout(5000)
+                except Exception:
+                    pass
+
+            extracted = await page.evaluate(PIKU_BROWSER_EXTRACT_SCRIPT)
+        finally:
+            await browser.close()
+
+    if not isinstance(extracted, dict):
+        raise GameParseError("PIKU 브라우저 자동화 결과가 예상과 달라요.")
+    try:
+        return parse_json_worldcup(extracted)
+    except GameParseError as exc:
+        text = str(extracted.get("text") or "")
+        if "Cloudflare" in text or "Attention Required" in text:
+            raise GameParseError(
+                "PIKU가 서버 브라우저 자동화도 Cloudflare에서 막았어요. "
+                "`/worldcup_export_script`로 사용자의 브라우저에서 후보를 추출해 주세요."
+            ) from exc
+        raise GameParseError(
+            "서버 브라우저로 PIKU 페이지를 열었지만 후보 목록을 찾지 못했어요. "
+            "PIKU가 시작 API를 막는 월드컵이면 `/worldcup_export_script`가 필요해요."
+        ) from exc
 
 
 async def read_json_attachment(attachment: discord.Attachment) -> dict[str, object]:
@@ -884,19 +1190,15 @@ def html_title(page: str, fallback: str) -> str:
     return fallback
 
 
-async def parse_worldcup_from_url(url: str) -> ParsedWorldcup:
+async def parse_worldcup_from_url(url: str, rounds: int | None = None) -> ParsedWorldcup:
     try:
         page = await fetch_text(url)
     except GameParseError as exc:
         if "HTTP 403" in str(exc):
-            raise GameParseError(
-                "PIKU가 현재 봇의 직접 접근을 막고 있어요. JSON fallback 파일을 같이 업로드해 주세요."
-            ) from exc
+            return await parse_worldcup_with_browser(url, rounds)
         raise
     if "cf_chl" in page or "Just a moment" in page:
-        raise GameParseError(
-            "PIKU가 현재 봇의 직접 접근을 막고 있어요. JSON fallback 파일을 같이 업로드해 주세요."
-        )
+        return await parse_worldcup_with_browser(url, rounds)
 
     title = html_title(page, "이상형 월드컵")
     items: list[GameItem] = []
@@ -934,9 +1236,7 @@ async def parse_worldcup_from_url(url: str) -> ParsedWorldcup:
         unique.setdefault((item.name, item.media_url), item)
     items = list(unique.values())
     if len(items) < 2:
-        raise GameParseError(
-            "PIKU 페이지에서 후보 목록을 찾지 못했어요. 해당 사이트가 데이터를 숨기면 JSON fallback이 필요해요."
-        )
+        return await parse_worldcup_with_browser(url, rounds)
     return ParsedWorldcup(title=title, items=items)
 
 
@@ -951,7 +1251,7 @@ def machugi_quiz_id(url: str) -> str:
         raise GameParseError("machugi.io 퀴즈 ID를 찾지 못했어요.") from exc
 
 
-async def parse_machugi_from_url(url: str, count: int) -> ParsedQuiz:
+async def parse_machugi_from_url(url: str, count: int | None) -> ParsedQuiz:
     quiz_id = machugi_quiz_id(url)
     headers = {"Origin": "https://machugi.io", "Referer": f"https://machugi.io/quiz/{quiz_id}"}
     page = await fetch_text(url, headers=headers)
@@ -972,7 +1272,14 @@ async def parse_machugi_from_url(url: str, count: int) -> ParsedQuiz:
     update_date = quiz_type.get("updatedDate") or quiz_type.get("updateDate")
     question_ids = quiz_type.get("questionIds")
     max_count = len(question_ids) if isinstance(question_ids, list) else count
-    request_count = max(1, min(count, max_count or count, 50))
+    offered_counts = [
+        int(value)
+        for value in re.findall(r">(\d+)개 풀기<", page)
+        if value.isdigit()
+    ]
+    default_count = max(offered_counts) if offered_counts else (max_count or 10)
+    requested_count = default_count if count is None or count <= 0 else count
+    request_count = max(1, min(requested_count, max_count or requested_count))
 
     timeout = aiohttp.ClientTimeout(total=20)
     async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
@@ -3153,6 +3460,7 @@ class BaseGameSession:
         self.last_activity = time.monotonic()
         self.timeout_task: asyncio.Task | None = None
         self.recruit_message: discord.Message | None = None
+        self.start_votes: set[int] = set()
 
     def touch(self) -> None:
         self.last_activity = time.monotonic()
@@ -3173,7 +3481,8 @@ class BaseGameSession:
         return (
             f"**{self.title}** 참가자를 모집하고 있어요.\n"
             f"참가자 {len(self.participants)}명: {names}\n"
-            "참여할 사람은 버튼을 누르고, 준비되면 시작해 주세요."
+            f"시작 동의 {len(self.start_votes)}/{len(self.participants)}명\n"
+            "참여할 사람은 참여를 누르고, 모두 시작에 동의하면 게임이 시작돼요."
         )
 
     def start_timeout(self) -> None:
@@ -3225,14 +3534,29 @@ class GameRecruitView(discord.ui.View):
         else:
             await interaction.response.send_message("이미 시작된 게임이에요.", ephemeral=True)
 
-    @discord.ui.button(label="시작", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="시작 동의", style=discord.ButtonStyle.success)
     async def start_button(
         self, interaction: discord.Interaction, _button: discord.ui.Button
     ) -> None:
-        if not self.session.can_control(interaction.user):
-            await interaction.response.send_message("방을 만든 사람이나 관리자만 시작할 수 있어요.", ephemeral=True)
+        if self.session.started:
+            await interaction.response.send_message("이미 시작된 게임이에요.", ephemeral=True)
             return
-        await interaction.response.defer()
+        if interaction.user.id not in self.session.participants:
+            await interaction.response.send_message("참가자만 시작에 동의할 수 있어요.", ephemeral=True)
+            return
+        self.session.start_votes.add(interaction.user.id)
+        self.session.start_votes.intersection_update(self.session.participants.keys())
+        self.session.touch()
+        if len(self.session.start_votes) < len(self.session.participants):
+            await interaction.response.send_message(
+                f"시작 동의를 기록했어요. ({len(self.session.start_votes)}/{len(self.session.participants)})",
+                ephemeral=True,
+            )
+            if self.session.recruit_message:
+                await self.session.recruit_message.edit(content=self.session.recruit_content(), view=self)
+            return
+
+        await interaction.response.send_message("모든 참가자가 동의했어요. 게임을 시작합니다.", ephemeral=True)
         for item in self.children:
             if isinstance(item, discord.ui.Button):
                 item.disabled = True
@@ -3399,11 +3723,7 @@ class QuizControlView(discord.ui.View):
     async def skip_button(
         self, interaction: discord.Interaction, _button: discord.ui.Button
     ) -> None:
-        if not self.session.can_control(interaction.user):
-            await interaction.response.send_message("방을 만든 사람이나 관리자만 스킵할 수 있어요.", ephemeral=True)
-            return
-        await interaction.response.defer()
-        await self.session.skip_question()
+        await self.session.vote_skip(interaction)
 
     @discord.ui.button(label="종료", style=discord.ButtonStyle.danger)
     async def end_button(
@@ -3429,6 +3749,37 @@ class QuizSession(BaseGameSession):
         self.index = 0
         self.scores: dict[int, int] = {}
         self.normalized_answers: set[str] = set()
+        self.skip_votes: set[int] = set()
+        self.question_lock = asyncio.Lock()
+        self.question_started_at = discord.utils.utcnow()
+
+    async def vote_skip(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id not in self.participants:
+            await interaction.response.send_message("참가자만 스킵에 동의할 수 있어요.", ephemeral=True)
+            return
+        self.skip_votes.add(interaction.user.id)
+        self.skip_votes.intersection_update(self.participants.keys())
+        self.touch()
+        vote_count = len(self.skip_votes)
+        participant_count = len(self.participants)
+        target_index = self.index
+        if len(self.skip_votes) < len(self.participants):
+            await interaction.response.send_message(
+                f"스킵 동의를 기록했어요. ({vote_count}/{participant_count})",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            f"스킵 동의를 기록했어요. ({vote_count}/{participant_count}) 모든 참가자가 동의해서 문제를 넘길게요.",
+            ephemeral=True,
+        )
+        async with self.question_lock:
+            if (
+                self.index != target_index
+                or len(self.skip_votes) < len(self.participants)
+            ):
+                return
+            await self.skip_question()
 
     async def start_game(self) -> None:
         self.started = True
@@ -3445,6 +3796,8 @@ class QuizSession(BaseGameSession):
             await self.finish()
             return
         question = self.questions[self.index]
+        self.skip_votes.clear()
+        self.question_started_at = discord.utils.utcnow()
         self.normalized_answers = {
             normalized for answer in question.answers if (normalized := normalize_answer(answer))
         }
@@ -3476,16 +3829,24 @@ class QuizSession(BaseGameSession):
         self.touch()
         if not self.started or message.author.id not in self.participants:
             return
-        answer = normalize_answer(message.content)
-        if not answer or answer not in self.normalized_answers:
-            return
-        self.scores[message.author.id] = self.scores.get(message.author.id, 0) + 1
-        question = self.questions[self.index]
-        await self.channel.send(
-            f"**{message.author.display_name}** 정답! 정답은 **{question.answers[0]}**"
-        )
-        self.index += 1
-        await self.present_question()
+        async with self.question_lock:
+            if self.index >= len(self.questions):
+                return
+            if message.created_at < self.question_started_at:
+                return
+            answer = normalize_answer(message.content)
+            current_answers = set(self.normalized_answers)
+            if not answer or answer not in current_answers:
+                return
+            self.normalized_answers.clear()
+            self.skip_votes.clear()
+            self.scores[message.author.id] = self.scores.get(message.author.id, 0) + 1
+            question = self.questions[self.index]
+            self.index += 1
+            await self.channel.send(
+                f"**{message.author.display_name}** 정답! 정답은 **{question.answers[0]}**"
+            )
+            await self.present_question()
 
     async def skip_question(self) -> None:
         if self.index >= len(self.questions):
@@ -3494,6 +3855,7 @@ class QuizSession(BaseGameSession):
         question = self.questions[self.index]
         await self.channel.send(f"문제를 넘겼어요. 정답은 **{question.answers[0]}**")
         self.index += 1
+        self.skip_votes.clear()
         self.touch()
         await self.present_question()
 
@@ -3585,10 +3947,16 @@ class PartyGames(commands.Cog):
             await interaction.followup.send("PIKU URL 또는 JSON fallback 파일이 필요해요.", ephemeral=True)
             return
         try:
-            parsed = parse_json_worldcup(await read_json_attachment(data)) if data else await parse_worldcup_from_url(url or "")
+            parsed = (
+                parse_json_worldcup(await read_json_attachment(data))
+                if data
+                else await parse_worldcup_from_url(url or "", rounds)
+            )
         except GameParseError as exc:
             message = str(exc)
-            if "PIKU" in message and "JSON fallback" in message:
+            if "PIKU" in message and (
+                "fallback" in message or "브라우저" in message or "후보 목록" in message
+            ):
                 message += (
                     "\n`/worldcup_export_script`로 브라우저 추출 스크립트를 받아서 "
                     "`piku-worldcup.json`을 자동 생성할 수 있어요."
@@ -3605,7 +3973,7 @@ class PartyGames(commands.Cog):
     @app_commands.describe(
         url="machugi.io 퀴즈 URL",
         data="직접 파싱이 막힐 때 사용할 JSON fallback 파일",
-        count="가져올 문제 수. 최대 50개",
+        count="가져올 문제 수. 0이면 사이트가 제공하는 최대 문제 수",
     )
     @app_commands.guild_only()
     async def quiz(
@@ -3613,14 +3981,18 @@ class PartyGames(commands.Cog):
         interaction: discord.Interaction,
         url: str | None = None,
         data: discord.Attachment | None = None,
-        count: app_commands.Range[int, 1, 50] = 10,
+        count: app_commands.Range[int, 0, 500] = 0,
     ) -> None:
         await interaction.response.defer(ephemeral=True)
         if not url and data is None:
             await interaction.followup.send("machugi URL 또는 JSON fallback 파일이 필요해요.", ephemeral=True)
             return
         try:
-            parsed = parse_json_quiz(await read_json_attachment(data)) if data else await parse_machugi_from_url(url or "", int(count))
+            parsed = (
+                parse_json_quiz(await read_json_attachment(data))
+                if data
+                else await parse_machugi_from_url(url or "", int(count))
+            )
         except GameParseError as exc:
             await interaction.followup.send(str(exc), ephemeral=True)
             return
@@ -4350,8 +4722,12 @@ async def on_ready() -> None:
             synced = await bot.tree.sync(guild=guild_object)
             print(f"Synced {len(synced)} guild slash commands to {SYNC_GUILD_ID}.")
         else:
-            synced = await bot.tree.sync()
-            print(f"Synced {len(synced)} global slash commands.")
+            global_synced = await bot.tree.sync()
+            print(f"Synced {len(global_synced)} global slash commands.")
+            for guild in bot.guilds:
+                bot.tree.copy_global_to(guild=guild)
+                synced = await bot.tree.sync(guild=guild)
+                print(f"Synced {len(synced)} guild slash commands to {guild.id}.")
         bot.synced_commands = True
 
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")

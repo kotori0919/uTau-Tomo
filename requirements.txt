@@ -2,6 +2,7 @@ aiohttp
 ddgs
 discord.py[voice]
 discord-ext-voice-recv
+playwright
 python-dotenv
 supertonic
 yt-dlp
