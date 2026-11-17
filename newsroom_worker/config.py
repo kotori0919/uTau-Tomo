@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
+from datetime import datetime, time
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -32,6 +34,17 @@ class Settings:
     knowledge_margin: float
     dry_run: bool
     browser_headless: bool
+
+    def publishing_paused(self, now: datetime) -> bool:
+        hours = self.config.get("quietHoursKst")
+        if not hours:
+            return False
+        start = time.fromisoformat(hours["start"])
+        end = time.fromisoformat(hours["end"])
+        local_time = now.astimezone(ZoneInfo("Asia/Seoul")).time()
+        if start > end:
+            return local_time >= start or local_time < end
+        return start <= local_time < end
 
     @classmethod
     def from_env(cls, root: Path | None = None) -> "Settings":

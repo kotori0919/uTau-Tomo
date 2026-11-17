@@ -5,6 +5,7 @@ import re
 import hashlib
 from datetime import datetime, timezone
 from collections import Counter
+from dataclasses import asdict
 from typing import Any
 
 import aiohttp
@@ -69,6 +70,15 @@ class NewsroomPipeline:
         )
         now = datetime.now(timezone.utc)
         stats = Counter()
+        reviewed = dict.fromkeys(state.get("reviewedUrls", []))
+        max_age = int(self.settings.config.get("maxArticleAgeHours", 24))
+        pending = {
+            article.url: article
+            for row in state.get("pendingNews", [])
+            if (article := Article(**row)).url not in posted
+            and (article.source == THREADS_SOURCE or article.url not in reviewed)
+            and is_fresh(article, now, max_age)
+        }
         if now.timestamp() - float(state.get("lastThreadsPoll", 0)) >= int(
             self.settings.config.get("pollSeconds", 600)
         ):
@@ -78,39 +88,20 @@ class NewsroomPipeline:
                 stats[f"{THREADS_SOURCE}:{threads.status}"] += 1
                 if threads.status != "ok":
                     log.warning("Threads collection status=%s detail=%s", threads.status, threads.detail)
-                for article in reversed(threads.articles):
+                for article in threads.articles:
                     if article.url in posted:
                         continue
-                    if not is_fresh(article, now, int(self.settings.config.get("maxArticleAgeHours", 24))):
+                    if not is_fresh(article, now, max_age):
                         stats["threads_stale_or_undated"] += 1
                         continue
-                    excerpt = article.body[:1200]
-                    message = f"**Threads @choi.openai**\n{excerpt}\n{article.url}"
-                    if await self.publisher.post(self.settings.channels[THREADS_SOURCE], message):
-                        posted[article.url] = None
-                        state["posted"] = list(posted)[-5000:]
-                        self.news_state.save(state)
-                        stats["threads_posted"] += 1
-                    else:
-                        stats["threads_publish_failed"] += 1
+                    pending[article.url] = article
                 state["lastThreadsPoll"] = now.timestamp()
+                state["pendingNews"] = [asdict(article) for article in pending.values()]
                 self.news_state.save(state)
-                log.info("Threads delivery posted=%s stale_or_undated=%s", stats["threads_posted"],
-                         stats["threads_stale_or_undated"])
             except Exception:
-                log.exception("Priority Threads delivery failed")
+                log.exception("Priority Threads collection failed")
 
         batches = await collect_feeds(self.session, self.settings.config.get("feeds", []))
-        if state.get("editorialModel") != self.settings.embedding_model or now.timestamp() - float(state.get("lastEditorialImport", 0)) >= 3600:
-            imported = await self.editor.import_channel_history(self.publisher, self.settings.channels, now)
-            previous = state.get("editorialHistory", []) if state.get("editorialModel") == self.settings.embedding_model else []
-            history = list({item["text"]: item for item in previous + imported}.values())
-            state["editorialHistory"] = history
-            state["editorialModel"] = self.settings.embedding_model
-            state["lastEditorialImport"] = now.timestamp()
-            self.news_state.save(state)
-        history = retained_history(state.get("editorialHistory", []), now)
-        reviewed = dict.fromkeys(state.get("reviewedUrls", []))
         if state.get("dailyDate") != now.date().isoformat():
             state["dailyDate"] = now.date().isoformat()
             state["dailyPosted"] = 0
@@ -122,7 +113,7 @@ class NewsroomPipeline:
             state["lastBrowserPoll"] = now.timestamp()
 
         report: list[str] = []
-        pending: list[Article] = []
+        alerts = set(state.get("pendingSourceAlerts", []))
         per_source_limit = int(self.settings.config["limits"]["newsPerSource"])
         total_limit = int(self.settings.config["limits"]["newsTotal"])
 
@@ -134,14 +125,13 @@ class NewsroomPipeline:
                     f"- {batch.source}: 파싱 결과 0건 ({empty_runs[batch.source]}회 연속)"
                 )
                 if empty_runs[batch.source] == 2:
-                    await self._selection_log(
-                        f"⚠️ {batch.source} 셀렉터 점검 필요: 2회 연속 수집 결과가 0건입니다."
-                    )
+                    alerts.add(batch.source)
                 continue
             if batch.status != "ok":
                 report.append(f"- {batch.source}: {batch.status} · {batch.detail}")
                 continue
             empty_runs[batch.source] = 0
+            alerts.discard(batch.source)
             if batch.source not in initialized:
                 baseline.update(dict.fromkeys(article.url for article in batch.articles))
                 initialized.add(batch.source)
@@ -149,26 +139,71 @@ class NewsroomPipeline:
                     f"- {batch.source}: 최초 실행 {len(batch.articles)}건 시드(백필 없음)"
                 )
                 continue
-            unseen = [article for article in batch.articles if article.url not in posted and article.url not in baseline and article.url not in reviewed]
-            unseen.sort(key=lambda article: article.published_at or "", reverse=True)
-            pending.extend(unseen)
+            unseen = [
+                article for article in batch.articles
+                if article.url not in posted and article.url not in baseline
+                and article.url not in reviewed and is_fresh(article, now, max_age)
+            ]
+            pending.update((article.url, article) for article in unseen)
             report.append(
                 f"- {batch.source}: 수집 {len(batch.articles)} · 신규 {len(unseen)}"
             )
 
-        pending.sort(key=lambda article: article.published_at or "", reverse=True)
+        ordered = sorted(pending.values(), key=lambda article: datetime.fromisoformat(article.published_at or ""), reverse=True)
+        state["pendingNews"] = [asdict(article) for article in ordered]
+        state["baseline"] = list(baseline)[-5000:]
+        state["initializedSources"] = sorted(initialized)
+        state["emptyRuns"] = dict(empty_runs)
+        state["pendingSourceAlerts"] = sorted(alerts)
+        self.news_state.save(state)
+        if self.settings.publishing_paused(datetime.now(timezone.utc)):
+            stats["quiet_hours_pending"] = len(ordered)
+            return {"stats": dict(stats), "report": report}
+
+        for article in reversed(ordered):
+            if self.settings.publishing_paused(datetime.now(timezone.utc)):
+                break
+            if article.source != THREADS_SOURCE:
+                continue
+            message = f"**Threads @choi.openai**\n{article.body[:1200]}\n{article.url}"
+            if await self.publisher.post(self.settings.channels[THREADS_SOURCE], message):
+                posted[article.url] = None
+                state["posted"] = list(posted)[-5000:]
+                self.news_state.save(state)
+                stats["threads_posted"] += 1
+            else:
+                stats["threads_publish_failed"] += 1
+        if stats.get(f"{THREADS_SOURCE}:ok") or stats["threads_posted"]:
+            log.info("Threads delivery posted=%s stale_or_undated=%s", stats["threads_posted"],
+                     stats["threads_stale_or_undated"])
+
+        for source in sorted(alerts):
+            if await self._selection_log(f"⚠️ {source} 셀렉터 점검 필요: 2회 연속 수집 결과가 0건입니다."):
+                alerts.remove(source)
+                state["pendingSourceAlerts"] = sorted(alerts)
+                self.news_state.save(state)
+
+        if state.get("editorialModel") != self.settings.embedding_model or now.timestamp() - float(state.get("lastEditorialImport", 0)) >= 3600:
+            imported = await self.editor.import_channel_history(self.publisher, self.settings.channels, now)
+            previous = state.get("editorialHistory", []) if state.get("editorialModel") == self.settings.embedding_model else []
+            history = list({item["text"]: item for item in previous + imported}.values())
+            state["editorialHistory"] = history
+            state["editorialModel"] = self.settings.embedding_model
+            state["lastEditorialImport"] = now.timestamp()
+            self.news_state.save(state)
+        history = retained_history(state.get("editorialHistory", []), now)
         source_posts = Counter()
         editorial_attempts = 0
-        for article in pending:
+        for article in ordered:
+            if self.settings.publishing_paused(datetime.now(timezone.utc)):
+                break
             if stats["posted"] >= total_limit or int(state.get("dailyPosted", 0)) >= int(self.settings.config["limits"].get("newsDaily", 60)):
                 break
-            if source_posts[article.source] >= per_source_limit or article.url in posted or article.url in reviewed:
+            if article.source == THREADS_SOURCE or source_posts[article.source] >= per_source_limit or article.url in posted or article.url in reviewed:
                 continue
             title_hash = hashlib.sha256(re.sub(r"\W+", "", article.title.casefold()).encode()).hexdigest()
             if title_hash in titles:
-                continue
-            if not is_fresh(article, now, int(self.settings.config.get("maxArticleAgeHours", 24))):
-                stats["stale"] += 1
+                reviewed[article.url] = None
                 continue
             if article.source.startswith("samsung_"):
                 try:
@@ -188,6 +223,7 @@ class NewsroomPipeline:
                 )
                 if not decision.keep:
                     stats["rejected"] += 1
+                    reviewed[article.url] = None
                     continue
             if editorial_attempts >= 20:
                 break
@@ -208,6 +244,7 @@ class NewsroomPipeline:
                 log.info("Embedding route source=%s channel=%s score=%.4f url=%s", article.source, channel_key, route_score, article.url)
                 if route_score < float(self.settings.config.get("routingThreshold", 0.5)):
                     stats["route_rejected"] += 1
+                    reviewed[article.url] = None
                     continue
             except Exception as exc:
                 stats["routing_failed"] += 1
@@ -244,6 +281,10 @@ class NewsroomPipeline:
         state["emptyRuns"] = dict(empty_runs)
         state["editorialHistory"] = history[-500:]
         state["reviewedUrls"] = list(reviewed)[-5000:]
+        state["pendingNews"] = [
+            asdict(article) for article in ordered
+            if article.url not in posted and (article.source == THREADS_SOURCE or article.url not in reviewed)
+        ]
         self.news_state.save(state)
         report.append(
             "- 결과: 게시 {posted} · 필터 탈락 {rejected} · 요약 실패 {summary_failed} · 게시 실패 {publish_failed}".format(

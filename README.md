@@ -243,6 +243,11 @@ publishers. Samsung browser collectors run hourly. Channel IDs,
 feeds, intervals, routing anchors and limits live in `config/newsroom.json`.
 Repository update notifications are disabled.
 
+During quiet hours (23:00–07:00 KST), the worker continues collecting articles
+and Threads posts. It saves candidates to disk and resumes Discord delivery on
+the next daytime cycle, subject to the usual freshness and deduplication rules.
+Newsroom reports and alerts also wait until daytime.
+
 General news is routed by `embeddinggemma-2` using its title and content against
 the technology, AI, hardware, security and research anchor sets. The highest
 cosine similarity selects the channel, subject to a minimum score; source names

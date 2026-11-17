@@ -23,6 +23,7 @@
     "threads_choi_openai": "https://www.threads.com/@choi.openai?hl=ko"
   },
   "pollSeconds": 600,
+  "quietHoursKst": {"start": "23:00", "end": "07:00"},
   "browserPollSeconds": 3600,
   "maxArticleAgeHours": 24,
   "routingThreshold": 0.5,

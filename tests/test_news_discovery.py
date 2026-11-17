@@ -37,6 +37,55 @@ class FeedTests(unittest.TestCase):
 
 
 class RoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_overnight_collection_survives_restart_and_delivers_at_seven_kst(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = replace(Settings.from_env(Path.cwd()), dry_run=False,
+                               state_path=Path(directory) / "state.json",
+                               repo_state_path=Path(directory) / "repo.json")
+            night = datetime.fromisoformat("2026-11-18T06:59:00+09:00")
+            morning = datetime.fromisoformat("2026-11-18T07:00:00+09:00")
+            self.assertTrue(settings.publishing_paused(datetime.fromisoformat("2026-11-17T23:00:00+09:00")))
+            self.assertFalse(settings.publishing_paused(datetime.fromisoformat("2026-11-17T22:59:59+09:00")))
+            threads = Article("threads_choi_openai", "https://www.threads.com/@choi.openai/post/night",
+                              "밤에 나온 글", "원문", night.isoformat())
+            news = Article("feed_test", "https://example.org/overnight", "Night news", "Body",
+                           night.isoformat())
+            batches = [[SourceBatch(news.source, [news]), SourceBatch("empty_feed", [], "parse_empty")], []]
+            pipeline = NewsroomPipeline(settings, None)
+            pipeline.news_state.save({"initializedSources": [news.source], "lastBrowserPoll": night.timestamp(),
+                                      "editorialModel": settings.embedding_model,
+                                      "lastEditorialImport": night.timestamp(), "emptyRuns": {"empty_feed": 1}})
+            pipeline.publisher.post = AsyncMock()
+            pipeline.editor.review = AsyncMock()
+            with patch("newsroom_worker.pipeline.datetime", wraps=datetime) as clock, patch(
+                "newsroom_worker.pipeline.collect_feeds", AsyncMock(side_effect=batches)
+            ), patch("newsroom_worker.pipeline.BrowserSources") as browser:
+                browser.return_value.__aenter__.return_value.collect_threads = AsyncMock(
+                    return_value=SourceBatch(threads.source, [threads])
+                )
+                clock.now.return_value = night.astimezone(timezone.utc)
+                held = await pipeline.run_news()
+                self.assertEqual(held["stats"]["quiet_hours_pending"], 2)
+                pipeline.publisher.post.assert_not_awaited()
+                pipeline.editor.review.assert_not_awaited()
+                self.assertNotIn("lastLogDate", pipeline.news_state.load()[0])
+
+                clock.now.return_value = morning.astimezone(timezone.utc)
+                restarted = NewsroomPipeline(settings, None)
+                restarted.publisher.post = AsyncMock(return_value=True)
+                restarted.editor.review = AsyncMock(return_value=(True, "new facts", [1., 0.]))
+                restarted.intelligence.route = AsyncMock(return_value=("technology", 0.9))
+                restarted.intelligence.summarize = AsyncMock(return_value="새 기능이 공개됐습니다.")
+                result = await restarted.run_news()
+            self.assertEqual(result["stats"]["threads_posted"], 1)
+            self.assertEqual(result["stats"]["posted"], 1)
+            sent = [call.args[1] for call in restarted.publisher.post.await_args_list]
+            self.assertTrue(any(threads.url in msg for msg in sent))
+            self.assertTrue(any(news.url in msg for msg in sent))
+            self.assertTrue(any("셀렉터 점검 필요" in msg for msg in sent))
+            self.assertTrue(any("STN 뉴스룸 수집 요약" in msg for msg in sent))
+            self.assertEqual(restarted.news_state.load()[0]["pendingNews"], [])
+
     async def test_daily_report_retries_failed_delivery_and_records_success(self):
         with tempfile.TemporaryDirectory() as directory:
             settings = replace(Settings.from_env(Path.cwd()), dry_run=False,

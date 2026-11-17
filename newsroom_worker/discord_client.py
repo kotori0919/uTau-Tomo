@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import datetime, timezone
 
 import aiohttp
 
@@ -67,6 +68,8 @@ class DiscordPublisher:
     async def post(self, channel_id: str, content: str) -> bool:
         if len(content) > 2000:
             raise ValueError("Discord message exceeds 2000 characters")
+        if self.settings.publishing_paused(datetime.now(timezone.utc)):
+            return False
         if self.settings.dry_run:
             log.info("Dry-run Discord post channel=%s content=%s", channel_id, content)
             return True
@@ -80,6 +83,8 @@ class DiscordPublisher:
         }
         payload = {"content": content, "allowed_mentions": {"parse": []}}
         for attempt in range(2):
+            if self.settings.publishing_paused(datetime.now(timezone.utc)):
+                return False
             async with self.session.post(
                 f"{DISCORD_API}/channels/{channel_id}/messages",
                 headers=headers,
