@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import math
 import re
@@ -70,13 +71,68 @@ class IntelligenceClient:
         async with self.session.post(
             f"{self.settings.llm_url}{path}", headers=self.headers, json=payload
         ) as response:
-            data = await response.json(content_type=None)
+            raw = await response.text()
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"LLM HTTP {response.status} returned non-JSON "
+                    f"({response.headers.get('content-type', 'unknown')})"
+                ) from exc
             if response.status >= 400:
                 message = data.get("error", data) if isinstance(data, dict) else data
                 raise RuntimeError(f"LLM HTTP {response.status}: {str(message)[:300]}")
             if not isinstance(data, dict):
                 raise RuntimeError("LLM returned a non-object response")
             return data
+
+    async def _stream_summary(self, messages: list[dict[str, str]]) -> str:
+        payload = {
+            "model": self.settings.summary_model,
+            "messages": messages,
+            "temperature": 0.2,
+            "max_tokens": self.settings.summary_max_tokens,
+            "stream": True,
+        }
+        chunks: list[str] = []
+        finish_reason: str | None = None
+        async with self.session.post(
+            f"{self.settings.llm_url}/chat/completions",
+            headers=self.headers,
+            json=payload,
+        ) as response:
+            if response.status >= 400:
+                body = await response.text()
+                raise RuntimeError(
+                    f"LLM HTTP {response.status}: {body[:200] if body else 'empty body'}"
+                )
+            async for raw_line in response.content:
+                line = raw_line.decode(errors="replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                value = line.removeprefix("data:").strip()
+                if value == "[DONE]":
+                    break
+                try:
+                    data = json.loads(value)
+                except json.JSONDecodeError:
+                    continue
+                for choice in data.get("choices", []):
+                    if not isinstance(choice, dict):
+                        continue
+                    delta = choice.get("delta")
+                    if isinstance(delta, dict) and isinstance(delta.get("content"), str):
+                        chunks.append(delta["content"])
+                    if choice.get("finish_reason") is not None:
+                        finish_reason = str(choice["finish_reason"])
+        answer = "".join(chunks)
+        if not answer:
+            raise RuntimeError(
+                "summary stream returned no final content "
+                f"(finish_reason={finish_reason or 'unknown'}, "
+                f"max_tokens={self.settings.summary_max_tokens})"
+            )
+        return answer
 
     async def embed_many(self, texts: list[str]) -> list[list[float]]:
         data = await self._json_post(
@@ -153,23 +209,12 @@ class IntelligenceClient:
             prompt = user_prompt
             if attempt:
                 prompt += "\n이전 답변이 너무 길었다. 반드시 공백 포함 120자 이내로 다시 쓴다."
-            data = await self._json_post(
-                "/chat/completions",
-                {
-                    "model": self.settings.summary_model,
-                    "messages": [
-                        {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt},
-                    ],
-                    "temperature": 0.2,
-                    "max_tokens": 300,
-                    "stream": False,
-                },
+            content = await self._stream_summary(
+                [
+                    {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ]
             )
-            try:
-                content = str(data["choices"][0]["message"]["content"])
-            except (KeyError, IndexError, TypeError) as exc:
-                raise RuntimeError("summary response has no message content") from exc
             summary = _clean_summary(content)
             if summary and len(summary) <= 120:
                 return summary

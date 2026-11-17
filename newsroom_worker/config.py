@@ -24,6 +24,7 @@ class Settings:
     llm_api_key: str
     embedding_model: str
     summary_model: str
+    summary_max_tokens: int
     github_token: str
     state_path: Path
     repo_state_path: Path
@@ -61,6 +62,9 @@ class Settings:
             summary_model=os.getenv(
                 "NEWSROOM_SUMMARY_MODEL",
                 os.getenv("LLM_MODEL", "deepseek-v4.1-flash"),
+            ),
+            summary_max_tokens=int(
+                os.getenv("NEWSROOM_SUMMARY_MAX_TOKENS", "2048")
             ),
             github_token=os.getenv("GITHUB_TOKEN", ""),
             state_path=resolve_path(

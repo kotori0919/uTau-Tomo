@@ -81,6 +81,7 @@ NEWSROOM_STATE_PATH=data/newsroom/state.json
 NEWSROOM_REPO_STATE_PATH=data/newsroom/repo-state.json
 NEWSROOM_EMBEDDING_MODEL=embeddinggemma-2
 NEWSROOM_SUMMARY_MODEL=deepseek-v4.1-flash
+NEWSROOM_SUMMARY_MAX_TOKENS=2048
 NEWSROOM_KNOWLEDGE_THRESHOLD=0.62
 NEWSROOM_KNOWLEDGE_MARGIN=0.035
 NEWSROOM_BROWSER_HEADLESS=true
@@ -250,6 +251,11 @@ Samsung articles must pass both the hard promotion-title rule and the
 limited to 120 Korean characters, and are not posted if summarization fails.
 Threads is accessed without signing in; a login wall skips that source for the
 run. CVE and hacking-related Threads posts are routed to the security channel.
+
+The configured gateway counts hidden reasoning inside `max_tokens`, so the
+worker streams with a 2048-token completion budget to obtain final content while
+discarding reasoning fields. Only the validated final summary is retained, and
+the published text remains hard-limited to 120 characters.
 
 Before starting the service, run:
 
