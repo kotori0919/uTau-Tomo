@@ -37,6 +37,40 @@ class FeedTests(unittest.TestCase):
 
 
 class RoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_priority_threads_posts_without_models_or_news_quota_and_retries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = replace(Settings.from_env(Path.cwd()),
+                               state_path=Path(directory) / "state.json",
+                               repo_state_path=Path(directory) / "repo.json")
+            pipeline = NewsroomPipeline(settings, None)
+            article = Article("threads_choi_openai", "https://www.threads.com/@choi.openai/post/test", "짧은 글", "기사 링크")
+            now = time.time()
+            pipeline.news_state.save({"editorialModel": settings.embedding_model,
+                                      "lastEditorialImport": now, "lastBrowserPoll": now,
+                                      "dailyDate": datetime.now(timezone.utc).date().isoformat(),
+                                      "dailyPosted": 99, "reviewedUrls": [article.url]})
+            pipeline.editor.review = AsyncMock()
+            pipeline.intelligence.route = AsyncMock()
+            pipeline.intelligence.summarize = AsyncMock()
+            pipeline._selection_log = AsyncMock()
+            pipeline.publisher.post = AsyncMock(side_effect=[False, True])
+            with patch("newsroom_worker.pipeline.collect_feeds", AsyncMock(return_value=[])), patch(
+                "newsroom_worker.pipeline.BrowserSources"
+            ) as browser:
+                browser.return_value.__aenter__.return_value.collect_threads = AsyncMock(
+                    return_value=SourceBatch(article.source, [article])
+                )
+                for _ in range(3):
+                    state, _ = pipeline.news_state.load()
+                    pipeline.news_state.save({**state, "lastThreadsPoll": 0})
+                    await pipeline.run_news()
+            self.assertEqual(pipeline.publisher.post.await_count, 2)
+            self.assertEqual(pipeline.publisher.post.call_args.args[0], settings.channels[article.source])
+            self.assertIn(article.url, pipeline.publisher.post.call_args.args[1])
+            pipeline.editor.review.assert_not_awaited()
+            pipeline.intelligence.route.assert_not_awaited()
+            pipeline.intelligence.summarize.assert_not_awaited()
+
     async def test_delivery_routes_by_content_retries_failure_and_deduplicates(self):
         with tempfile.TemporaryDirectory() as directory:
             settings = replace(Settings.from_env(Path.cwd()),
@@ -45,6 +79,7 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
             pipeline = NewsroomPipeline(settings, None)
             pipeline.news_state.save({"initializedSources": ["feed_test"],
                                       "editorialModel": settings.embedding_model,
+                                      "lastThreadsPoll": time.time(),
                                       "lastEditorialImport": time.time(),
                                       "posted": [], "lastBrowserPoll": time.time()})
             pipeline.editor.review = AsyncMock(return_value=(True, "New patch", [1., 0.]))

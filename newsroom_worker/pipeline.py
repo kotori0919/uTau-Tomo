@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import re
 import hashlib
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from collections import Counter
 from typing import Any
 
@@ -25,6 +25,7 @@ from .state import AtomicJsonState, news_state_default, repo_state_default
 
 
 log = logging.getLogger(__name__)
+THREADS_SOURCE = "threads_choi_openai"
 
 
 class NewsroomPipeline:
@@ -64,8 +65,35 @@ class NewsroomPipeline:
         empty_runs = Counter(
             {str(k): int(v) for k, v in dict(state.get("emptyRuns", {})).items()}
         )
-        batches = await collect_feeds(self.session, self.settings.config.get("feeds", []))
         now = datetime.now(timezone.utc)
+        stats = Counter()
+        if now.timestamp() - float(state.get("lastThreadsPoll", 0)) >= int(
+            self.settings.config.get("pollSeconds", 600)
+        ):
+            try:
+                async with BrowserSources(self.settings) as sources:
+                    threads = await sources.collect_threads()
+                stats[f"{THREADS_SOURCE}:{threads.status}"] += 1
+                if threads.status != "ok":
+                    log.warning("Threads collection status=%s detail=%s", threads.status, threads.detail)
+                for article in reversed(threads.articles):
+                    if article.url in posted:
+                        continue
+                    excerpt = article.body[:1200]
+                    message = f"**Threads @choi.openai**\n{excerpt}\n{article.url}"
+                    if await self.publisher.post(self.settings.channels[THREADS_SOURCE], message):
+                        posted[article.url] = None
+                        state["posted"] = list(posted)[-5000:]
+                        self.news_state.save(state)
+                        stats["threads_posted"] += 1
+                    else:
+                        stats["threads_publish_failed"] += 1
+                state["lastThreadsPoll"] = now.timestamp()
+                self.news_state.save(state)
+            except Exception:
+                log.exception("Priority Threads delivery failed")
+
+        batches = await collect_feeds(self.session, self.settings.config.get("feeds", []))
         if state.get("editorialModel") != self.settings.embedding_model or now.timestamp() - float(state.get("lastEditorialImport", 0)) >= 3600:
             imported = await self.editor.import_channel_history(self.publisher, self.settings.channels, now)
             previous = state.get("editorialHistory", []) if state.get("editorialModel") == self.settings.embedding_model else []
@@ -82,10 +110,10 @@ class NewsroomPipeline:
         browser_due = now.timestamp() - float(state.get("lastBrowserPoll", 0)) >= int(self.settings.config.get("browserPollSeconds", 3600))
         if browser_due:
             async with BrowserSources(self.settings) as sources:
-                batches.extend(await sources.collect_all())
+                batches.append(await sources.collect_samsung_display())
+                batches.append(await sources.collect_samsung_semiconductor())
             state["lastBrowserPoll"] = now.timestamp()
 
-        stats = Counter()
         report: list[str] = []
         pending: list[Article] = []
         per_source_limit = int(self.settings.config["limits"]["newsPerSource"])
@@ -127,7 +155,7 @@ class NewsroomPipeline:
         for article in pending:
             if stats["posted"] >= total_limit or int(state.get("dailyPosted", 0)) >= int(self.settings.config["limits"].get("newsDaily", 60)):
                 break
-            if source_posts[article.source] >= per_source_limit or article.url in posted:
+            if source_posts[article.source] >= per_source_limit or article.url in posted or article.url in reviewed:
                 continue
             title_hash = hashlib.sha256(re.sub(r"\W+", "", article.title.casefold()).encode()).hexdigest()
             if title_hash in titles:

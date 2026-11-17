@@ -239,11 +239,11 @@ Keep the API key in `.env`; do not put the real credential in tracked files.
 `newsroom_worker` checks RSS/Atom feeds and Korean Google News search feeds every
 10 minutes. Sources include Ars Technica, The Verge, BleepingComputer, The Hacker
 News, Hugging Face and arXiv; search feeds discover articles from additional
-publishers. Samsung and Threads browser collectors run hourly. Channel IDs,
+publishers. Samsung browser collectors run hourly. Channel IDs,
 feeds, intervals, routing anchors and limits live in `config/newsroom.json`.
 Repository update notifications are disabled.
 
-Every article is routed by `embeddinggemma-2` using its title and content against
+General news is routed by `embeddinggemma-2` using its title and content against
 the technology, AI, hardware, security and research anchor sets. The highest
 cosine similarity selects the channel, subject to a minimum score; source names
 and keyword rules do not select the channel. Failed embeddings defer publication.
@@ -267,8 +267,11 @@ the API accepts it, so failed posts are retried on the next scheduled run.
 Samsung articles must pass both the hard promotion-title rule and the
 `embeddinggemma-2` similarity filter. Summaries use `deepseek-v4.1-flash`, are
 limited to 120 Korean characters, and are not posted if summarization fails.
-Threads is accessed without signing in; a login wall skips that source for the
-run. Threads posts use the same content-based embedding routing as other sources.
+The worker checks public Threads posts from `@choi.openai` each cycle and
+forwards each newly seen post to the AI news channel. Delivery uses a source
+excerpt and original link, with URL deduplication. Editorial filtering,
+article age, model availability and general news quotas do not gate this feed.
+A login wall skips the source for that run.
 
 The configured gateway counts hidden reasoning inside `max_tokens`, so the
 worker streams with a 2048-token completion budget to obtain final content while

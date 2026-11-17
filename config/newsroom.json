@@ -30,7 +30,7 @@
     "technology": ["소프트웨어 개발, 프로그래밍 언어, 운영체제, 오픈소스, 개발 도구와 인터넷 기술 뉴스", "Software engineering, programming languages, open source, web development, operating systems news"],
     "ai": ["인공지능 모델 출시, 대규모 언어 모델, 생성형 AI 서비스, 에이전트와 머신러닝 산업 뉴스", "Artificial intelligence model releases, LLM, generative AI products, AI agents and machine learning industry"],
     "hardware": ["반도체 칩, GPU CPU, 메모리, 디스플레이, 서버와 컴퓨터 하드웨어 기술 뉴스", "Semiconductor chips, GPU, CPU, memory, displays, computer hardware and systems engineering"],
-    "security": ["보안 취약점, CVE, 해킹 공격, 랜섬웨어, 악성코드, 데이터 유출과 보안 패치 소식", "Cybersecurity vulnerabilities, CVE, ransomware, malware, exploits, data breaches and security patches"],
+    "security": ["보안 취약점, CVE, 해킹 공격, 랜섬웨어, 악성코드, 데이터 유출과 보안 패치 소식", "Cybersecurity vulnerabilities, CVE, ransomware, malware, exploits, data breaches and security patches", "Researchers disclose security flaws enabling account hijacking, ownership verification bypass or software and AI model supply-chain compromise"],
     "research": ["새로운 연구 논문, 학술 연구 결과, 실험, 과학적 발견, arXiv 논문과 연구 방법론", "New research papers, arXiv preprints, academic studies, scientific experiments, discoveries and research methodology"]
   },
   "feeds": [

@@ -226,18 +226,21 @@ class BrowserSources:
             )
             links = _unique_links(
                 rows,
-                lambda href: "threads.com" in urlsplit(href).netloc
+                lambda href: urlsplit(href).hostname in {"threads.com", "www.threads.com"}
                 and "/@choi.openai/post/" in urlsplit(href).path,
             )
-            by_url = {canonicalize_url(str(row.get("href") or "")): row for row in rows}
+            by_url: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                url = canonicalize_url(str(row.get("href") or ""))
+                if len(row["text"]) > len(by_url.get(url, {}).get("text", "")) or url not in by_url:
+                    by_url[url] = row
             limit = int(self.settings.config["limits"]["candidateScan"])
             articles: list[Article] = []
             for link in links[:limit]:
                 row = by_url.get(link["href"], {})
                 body = " ".join(str(row.get("text") or link["text"]).split())
-                if len(body) < 10:
-                    continue
-                title = body.split("\n", 1)[0][:120] if "\n" in body else body[:120]
+                body = re.sub(r"^@?choi\.openai\s+(?:\d+\s*(?:초|분|시간|일)\s*)?", "", body)
+                title = body[:120] or "Threads 게시물"
                 articles.append(
                     Article(
                         source=source,
