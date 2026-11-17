@@ -20,6 +20,7 @@ from .intelligence import IntelligenceClient
 from .models import Article, SourceBatch, canonicalize_url
 from .sources import BrowserSources, GitHubSource
 from .feeds import collect_feeds
+from .editorial import NewsEditor, is_fresh, retained_history
 from .state import AtomicJsonState, news_state_default, repo_state_default
 
 
@@ -32,6 +33,7 @@ class NewsroomPipeline:
         self.session = session
         self.intelligence = IntelligenceClient(settings, session)
         self.publisher = DiscordPublisher(settings, session)
+        self.editor = NewsEditor(self.intelligence)
         seeds = [
             canonicalize_url(str(url))
             for url in settings.config.get("initialPostedUrls", [])
@@ -64,6 +66,16 @@ class NewsroomPipeline:
         )
         batches = await collect_feeds(self.session, self.settings.config.get("feeds", []))
         now = datetime.now(timezone.utc)
+        if state.get("editorialModel") != self.settings.embedding_model or now.timestamp() - float(state.get("lastEditorialImport", 0)) >= 3600:
+            imported = await self.editor.import_channel_history(self.publisher, self.settings.channels, now)
+            previous = state.get("editorialHistory", []) if state.get("editorialModel") == self.settings.embedding_model else []
+            history = list({item["text"]: item for item in previous + imported}.values())
+            state["editorialHistory"] = history
+            state["editorialModel"] = self.settings.embedding_model
+            state["lastEditorialImport"] = now.timestamp()
+            self.news_state.save(state)
+        history = retained_history(state.get("editorialHistory", []), now)
+        reviewed = dict.fromkeys(state.get("reviewedUrls", []))
         if state.get("dailyDate") != now.date().isoformat():
             state["dailyDate"] = now.date().isoformat()
             state["dailyPosted"] = 0
@@ -102,7 +114,7 @@ class NewsroomPipeline:
                     f"- {batch.source}: 최초 실행 {len(batch.articles)}건 시드(백필 없음)"
                 )
                 continue
-            unseen = [article for article in batch.articles if article.url not in posted and article.url not in baseline]
+            unseen = [article for article in batch.articles if article.url not in posted and article.url not in baseline and article.url not in reviewed]
             unseen.sort(key=lambda article: article.published_at or "", reverse=True)
             pending.extend(unseen)
             report.append(
@@ -111,6 +123,7 @@ class NewsroomPipeline:
 
         pending.sort(key=lambda article: article.published_at or "", reverse=True)
         source_posts = Counter()
+        editorial_attempts = 0
         for article in pending:
             if stats["posted"] >= total_limit or int(state.get("dailyPosted", 0)) >= int(self.settings.config["limits"].get("newsDaily", 60)):
                 break
@@ -119,15 +132,9 @@ class NewsroomPipeline:
             title_hash = hashlib.sha256(re.sub(r"\W+", "", article.title.casefold()).encode()).hexdigest()
             if title_hash in titles:
                 continue
-            if article.published_at:
-                try:
-                    published = datetime.fromisoformat(article.published_at.replace("Z", "+00:00"))
-                    if published.tzinfo is None:
-                        published = published.replace(tzinfo=timezone.utc)
-                    if published < now - timedelta(hours=int(self.settings.config.get("maxArticleAgeHours", 48))):
-                        continue
-                except ValueError:
-                    continue
+            if not is_fresh(article, now, int(self.settings.config.get("maxArticleAgeHours", 24))):
+                stats["stale"] += 1
+                continue
             if article.source.startswith("samsung_"):
                 try:
                     decision = await self.intelligence.classify(article)
@@ -147,6 +154,20 @@ class NewsroomPipeline:
                 if not decision.keep:
                     stats["rejected"] += 1
                     continue
+            if editorial_attempts >= 20:
+                break
+            editorial_attempts += 1
+            try:
+                keep, reason, news_vector = await self.editor.review(article, history)
+                log.info("Editorial decision keep=%s reason=%s url=%s", keep, reason, article.url)
+                if not keep:
+                    reviewed[article.url] = None
+                    stats["editorial_rejected"] += 1
+                    continue
+            except Exception as exc:
+                stats["editorial_failed"] += 1
+                log.error("Editorial review failed url=%s error=%s", article.url, exc)
+                continue
             try:
                 channel_key, route_score = await self.intelligence.route(article)
                 log.info("Embedding route source=%s channel=%s score=%.4f url=%s", article.source, channel_key, route_score, article.url)
@@ -169,6 +190,8 @@ class NewsroomPipeline:
                 titles[title_hash] = None
                 source_posts[article.source] += 1
                 state["dailyPosted"] = int(state.get("dailyPosted", 0)) + 1
+                history.append({"text": article.title + "\n" + article.body[:1500], "vector": news_vector, "at": now.isoformat()})
+                state["editorialHistory"] = history[-500:]
                 state["posted"] = list(posted)[-5000:]
                 state["titleHashes"] = list(titles)[-5000:]
                 state["baseline"] = list(baseline)[-5000:]
@@ -184,6 +207,8 @@ class NewsroomPipeline:
         state["baseline"] = list(baseline)[-5000:]
         state["initializedSources"] = sorted(initialized)
         state["emptyRuns"] = dict(empty_runs)
+        state["editorialHistory"] = history[-500:]
+        state["reviewedUrls"] = list(reviewed)[-5000:]
         self.news_state.save(state)
         report.append(
             "- 결과: 게시 {posted} · 필터 탈락 {rejected} · 요약 실패 {summary_failed} · 게시 실패 {publish_failed}".format(

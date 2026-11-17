@@ -247,9 +247,17 @@ Every article is routed by `embeddinggemma-2` using its title and content agains
 the technology, AI, hardware, security and research anchor sets. The highest
 cosine similarity selects the channel, subject to a minimum score; source names
 and keyword rules do not select the channel. Failed embeddings defer publication.
-The worker publishes at most 8 items per cycle, 3 per source per cycle and 60
-per UTC day. Only articles from the last 48 hours are considered. New feeds are
-seeded without backfill. URLs and normalized title hashes prevent duplicates.
+The worker publishes at most 4 items per cycle, 2 per source per cycle and 20
+per UTC day. These are ceilings, not quotas. Only articles from the last 24 hours
+with valid dates are considered; missing and future dates are rejected.
+New feeds are seeded without backfill. URLs and normalized title hashes prevent
+exact duplicates. `embeddinggemma-2` compares candidate content against seven
+days of recent posts, including feed-channel bot messages imported hourly.
+An editorial DeepSeek check then requires useful, concrete new facts: translated
+reprints, recap articles, introductory tutorials, speculation and promotional
+pieces are rejected. Material updates to an earlier story can pass when they
+add a new patch, confirmed impact or research result. Model errors defer posting.
+Rejected URLs are cached; failed publications remain eligible for retry.
 
 The two state files are written through a temporary file and `os.replace`.
 On the first run, or after unreadable state, the worker seeds the current URLs,

@@ -24,7 +24,7 @@
   },
   "pollSeconds": 600,
   "browserPollSeconds": 3600,
-  "maxArticleAgeHours": 48,
+  "maxArticleAgeHours": 24,
   "routingThreshold": 0.5,
   "routingAnchors": {
     "technology": ["소프트웨어 개발, 프로그래밍 언어, 운영체제, 오픈소스, 개발 도구와 인터넷 기술 뉴스", "Software engineering, programming languages, open source, web development, operating systems news"],
@@ -64,9 +64,9 @@
     "https://www.threads.com/@choi.openai/post/Df1_SvsDGOm"
   ],
   "limits": {
-    "newsDaily": 60,
-    "newsPerSource": 3,
-    "newsTotal": 8,
+    "newsDaily": 20,
+    "newsPerSource": 2,
+    "newsTotal": 4,
     "repoTotal": 10,
     "candidateScan": 15
   }

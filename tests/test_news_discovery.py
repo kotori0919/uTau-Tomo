@@ -44,7 +44,10 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
                                repo_state_path=Path(directory) / "repo.json")
             pipeline = NewsroomPipeline(settings, None)
             pipeline.news_state.save({"initializedSources": ["feed_test"],
+                                      "editorialModel": settings.embedding_model,
+                                      "lastEditorialImport": time.time(),
                                       "posted": [], "lastBrowserPoll": time.time()})
+            pipeline.editor.review = AsyncMock(return_value=(True, "New patch", [1., 0.]))
             article = Article("feed_test", "https://example.com/cve", "Vulnerability",
                               "New security patch", datetime.now(timezone.utc).isoformat())
             pipeline.intelligence.route = AsyncMock(return_value=("security", 0.9))
