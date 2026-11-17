@@ -1,0 +1,15 @@
+[Unit]
+Description=STN Newsroom Collection and Publishing Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/kotori9/app/dimigo-HD-Music-Bot
+EnvironmentFile=/home/kotori9/app/dimigo-HD-Music-Bot/.env
+ExecStart=/home/kotori9/app/dimigo-HD-Music-Bot/venv/bin/python -m newsroom_worker run
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=default.target

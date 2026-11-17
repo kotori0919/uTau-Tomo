@@ -1,0 +1,45 @@
+{
+  "guildId": "1556220687553667175",
+  "channels": {
+    "github_repo": "1556222821292834927",
+    "samsung_display": "1556291437409210469",
+    "samsung_semiconductor": "1556291437409210469",
+    "threads_choi_openai": "1556291399790493798",
+    "threads_security": "1556291474826600599",
+    "selection_log": "1556225238717698098"
+  },
+  "github": {
+    "repo": "kotori0919/dimigo-HD-Music-Bot",
+    "branch": "main"
+  },
+  "sources": {
+    "samsung_display": "https://news.samsungdisplay.com/",
+    "samsung_semiconductor": "https://news.samsungsemiconductor.com/kr/",
+    "threads_choi_openai": "https://www.threads.com/@choi.openai?hl=ko"
+  },
+  "knowledgeAnchors": [
+    "디스플레이와 반도체의 기술 원리와 동작 방식을 설명하는 문서",
+    "공정, 소자, 재료, 장비의 구조와 원리를 해설하는 기술 아티클",
+    "용어와 개념을 정의하고 예시로 풀어 주는 학습 자료",
+    "기술 동향과 아키텍처를 분석한 심층 리포트"
+  ],
+  "promotionAnchors": [
+    "수상 실적과 수상 목록을 알리는 보도자료",
+    "매출과 점유율 등 경영 성과를 발표하는 기사",
+    "채용 공고와 인사 소식",
+    "MOU, 협약, 투자, 공급계약 체결 보도",
+    "창립기념식, 행사 개최, 사회공헌 캠페인 안내",
+    "신제품 출시 홍보"
+  ],
+  "initialPostedUrls": [
+    "https://news.samsungsemiconductor.com/kr/삼성전자-ces-2027-혁신상-수상/",
+    "https://news.samsungdisplay.com/34538",
+    "https://www.threads.com/@choi.openai/post/Df1_SvsDGOm"
+  ],
+  "limits": {
+    "newsPerSource": 3,
+    "newsTotal": 8,
+    "repoTotal": 10,
+    "candidateScan": 15
+  }
+}

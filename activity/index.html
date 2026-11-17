@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>HD 같이 보기</title>
+    <link rel="stylesheet" href="/activity/assets/style.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <p class="eyebrow">HD MUSIC BOT</p>
+          <h1>같이 보기</h1>
+        </div>
+        <p id="status" aria-live="polite">Discord에 연결하는 중…</p>
+      </header>
+      <section id="empty-state" class="empty-state">
+        <h2>아직 선택된 영상이 없어요</h2>
+        <p>음성 채널에서 <code>/watch</code> 명령으로 YouTube 영상을 골라 주세요.</p>
+      </section>
+      <section id="player-section" hidden>
+        <div id="player"></div>
+        <div class="controls">
+          <button id="back" type="button" aria-label="10초 뒤로">−10초</button>
+          <button id="toggle" type="button">재생</button>
+          <button id="forward" type="button" aria-label="10초 앞으로">+10초</button>
+        </div>
+        <p id="video-title"></p>
+      </section>
+    </main>
+    <script src="/activity/config.js"></script>
+    <script type="module" src="/activity/assets/app.js"></script>
+  </body>
+</html>

@@ -12,6 +12,7 @@ A Discord slash-command music bot with configurable local LLM chat memory, voice
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+playwright install chromium
 ```
 
 4. Copy `.env.example` to `.env` and fill in at least `DISCORD_TOKEN`.
@@ -22,6 +23,15 @@ python3 bot.py
 ```
 
 `PORT` is optional. When set, the bot opens a small HTTP health check that returns `OK`.
+
+The STN newsroom collector is a separate worker so browser crawling and scheduled
+publishing cannot block music playback:
+
+```bash
+python3 -m newsroom_worker check
+python3 -m newsroom_worker once all
+python3 -m newsroom_worker run
+```
 
 ## Environment
 
@@ -34,21 +44,22 @@ DISCORD_GUILD_ID=your-test-server-id
 # Optional opus path if auto-loading fails.
 OPUS_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu/libopus.so.0
 
-# LLM backend. The default setup uses Ollama on the local network.
-LLM_BACKEND=ollama
-LLM_URL=http://192.168.0.42:11434
-LLM_MODEL=SuperQwen-AgentWorld-35B-A3B:Q4
+# OpenAI-compatible LLM backend.
+LLM_BACKEND=openai
+LLM_URL=https://monapi.kotori9.run/v1
+LLM_MODEL=deepseek-v4.1-flash
+LLM_API_KEY=your-llm-api-key
 LLM_TIMEOUT=180
 LLM_MAX_TOKENS=2048
 LLM_TOOL_MAX_STEPS=2
 LLM_FALLBACK_ENABLED=false
 LLM_FALLBACK_BACKEND=ollama
-LLM_FALLBACK_URL=http://192.168.0.42:11434
-LLM_FALLBACK_MODEL=SuperQwen-AgentWorld-35B-A3B:Q4
+LLM_FALLBACK_URL=http://192.168.0.197:11434
+LLM_FALLBACK_MODEL=Qwythos-v2-9B:Q5
 LLM_FALLBACK_TIMEOUT=180
 AI_PROMPT_PATH=ai_prompt.md
 
-# Optional only when LLM_BACKEND=nim.
+# Optional only when LLM_BACKEND=nim. LLM_API_KEY takes precedence.
 # NIM_TOKEN=your-nvidia-nim-token
 
 # Web search for AI answers
@@ -60,6 +71,20 @@ BOT_DATA_DIR=data
 MEMORY_DB_PATH=data/memory.sqlite3
 MAX_PLAYLIST_TRACKS=100
 VOICE_EMPTY_DISCONNECT_SECONDS=30
+
+# YouTube stream client used by yt-dlp. Keep this as android unless needed.
+YTDL_YOUTUBE_PLAYER_CLIENT=android
+
+# STN newsroom worker (reuses the Discord and LLM credentials above)
+NEWSROOM_CONFIG_PATH=config/newsroom.json
+NEWSROOM_STATE_PATH=data/newsroom/state.json
+NEWSROOM_REPO_STATE_PATH=data/newsroom/repo-state.json
+NEWSROOM_EMBEDDING_MODEL=embeddinggemma-2
+NEWSROOM_SUMMARY_MODEL=deepseek-v4.1-flash
+NEWSROOM_KNOWLEDGE_THRESHOLD=0.62
+NEWSROOM_KNOWLEDGE_MARGIN=0.035
+NEWSROOM_BROWSER_HEADLESS=true
+NEWSROOM_DRY_RUN=false
 
 # Supertonic 3 TTS
 SUPERTONIC_DEFAULT_VOICE=M4
@@ -73,7 +98,8 @@ SUPERTONIC_MAX_CHARS=700
 
 ## Slash Commands
 
-- `/play query`: add a song or a YouTube playlist to the queue. If nothing is playing, it starts playback.
+- `/play query video:false`: add a song or a YouTube playlist to the queue. `video` defaults to `false`; set it to `true` to show the YouTube link/embed for only the tracks added by that command when they begin playing.
+- `/watch query`: stop the music queue, select a YouTube video, and launch the Discord Activity for the caller's voice channel.
 - `/skip`: vote to skip the current song. Only users in the bot's current voice channel can vote. The majority threshold is based on non-bot, non-admin listeners; administrators skip immediately.
 - `/back`: go back to the previous song. Administrator only.
 - `/seek timestamp`: jump the current video/song to a timestamp such as `90`, `1:30`, `01:02:03`, or `1m30s`.
@@ -84,9 +110,11 @@ SUPERTONIC_MAX_CHARS=700
 - `/pause`: pause the current song.
 - `/resume`: resume a paused song.
 - `/volume volume`: set playback volume from 0 to 200.
+Discord's standard bot voice API sends audio only; it cannot start a Go Live screen share. `video:true` therefore posts the YouTube link with its Discord preview, so participants can open the same video together. A person in the channel must start an actual screen share.
 - `/context_reset`: reset your personal AI context and long-term memory in this server.
 - `/server_context_reset`: reset shared server context. Administrator only.
 - `/llm_toggle enabled`: turn mention/voice LLM responses on or off for this server. Administrator only.
+- Mention-chat moderation: administrators can ask the LLM to timeout, remove timeout, kick, ban, or unban a user. The bot executes this only through the admin-only `discord_moderation` tool after checking Discord permissions and role hierarchy.
 - `/voice_join always_reply`: join your voice channel, listen, answer with the configured LLM, and speak using Supertonic TTS.
 - `/voice_leave`: vote to stop voice conversation and leave. Only users in the bot's current voice channel can vote, and a majority of non-bot listeners must agree. Administrators leave immediately.
 - `/tts_message text play_in_voice`: generate a WAV voice message with the configured TTS voice. Optionally also play it in your voice channel.
@@ -96,13 +124,21 @@ SUPERTONIC_MAX_CHARS=700
 - `/worldcup_export_script`: get a browser-side export script for PIKU pages that block direct bot access.
 - `/quiz url data count`: start a machugi.io competitive quiz in the current channel. `count=0` uses the largest question count offered by the page. Users join with a button, every joined participant must agree to start, then answers are accepted in chat. The first participant to type an accepted answer gets the point.
 
+
+## Watch Together Activity
+
+`/watch` launches this app's Discord Activity instead of trying to screen-share from the bot account. Everyone in the voice channel gets a YouTube player inside Discord; play, pause, and 10-second seeks are synchronized through the bot service. The bot stops its music queue first so the audio is not played twice.
+
+Before using it, serve this project at a public HTTPS hostname and set `ACTIVITY_PUBLIC_URL` to that base URL. In the Developer Portal, enable **Activities** and set the Root Mapping to prefix `/` and that hostname (without `https://`). Then add these Proxy Path Mappings before the `/` mapping: `/youtube` → `www.youtube.com`, and `/jsdelivr` → `cdn.jsdelivr.net`. Restart the bot after changing the environment variable.
+
+The standard Discord bot voice API still cannot start a Go Live screen share. Do not use a user-token/self-bot workaround; the Activity is the supported co-watching implementation.
 ## Party Games
 
 `/quiz` directly parses machugi.io quiz pages and calls the site's question API with the original answer arrays. Image, video, audio, and text questions are shown in Discord when the source data includes those media URLs.
 
-`/worldcup` tries to parse PIKU pages directly. PIKU may return a Cloudflare block to server-side bot requests. In that case, use `/worldcup_export_script`, open the PIKU page in your normal browser, run the script in the browser console after the candidates are loaded, then upload the downloaded `piku-worldcup.json` with the `data` option.
+`/worldcup` tries to parse PIKU pages directly. PIKU may return a Cloudflare block to server-side bot requests. In that case, use `/worldcup_export_script`, open the PIKU page in your normal browser, press `시작하기` yourself, run the script on the active A vs B match screen, then upload the downloaded `piku-worldcup.json` with the `data` option.
 
-If the script extracts too few items, start the worldcup on PIKU first and run it again on the active match screen. The script scans page state, browser storage, and visible media elements, so it works best after PIKU has loaded the candidate list into the client.
+If the script extracts too few items, run it again on the active A vs B match screen and enter the desired first-round size when prompted. The script scans page state, browser storage, visible media elements, and CSS background images, then advances the original PIKU match to collect candidates from the first round.
 
 Worldcup fallback JSON:
 
@@ -184,16 +220,58 @@ When the bot is alone in a voice channel for `VOICE_EMPTY_DISCONNECT_SECONDS`, i
 4. Invite or re-invite the bot with the updated install URL.
 5. During development, set `DISCORD_GUILD_ID` to your server ID for fast command sync. Remove it later for global sync.
 
-## Ollama Check
+## LLM Check
 
 The bot calls:
 
 ```bash
-curl http://192.168.0.42:11434/api/generate -d '{
-  "model": "SuperQwen-AgentWorld-35B-A3B:Q4",
-  "prompt": "Why is the sky blue?",
-  "stream": false
-}'
+curl https://monapi.kotori9.run/v1/chat/completions \
+  -H "Authorization: Bearer $LLM_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"Reply with OK"}]}'
 ```
 
-Make sure the machine running the bot can reach `192.168.0.42:11434`.
+Keep the API key in `.env`; do not put the real credential in tracked files.
+
+## STN Newsroom Worker
+
+`newsroom_worker` publishes repository updates every six hours and runs the
+Samsung Display, Samsung Semiconductor, and Threads collectors at 08:30 KST
+with a five-minute jitter. Channel IDs, source URLs, filtering anchors, limits,
+and the watched repository live in `config/newsroom.json`.
+
+The two state files are written through a temporary file and `os.replace`.
+On the first run, or after unreadable state, the worker seeds the current URLs,
+commits, and tags without posting them. A Discord message is recorded only after
+the API accepts it, so failed posts are retried on the next scheduled run.
+
+Samsung articles must pass both the hard promotion-title rule and the
+`embeddinggemma-2` similarity filter. Summaries use `deepseek-v4.1-flash`, are
+limited to 120 Korean characters, and are not posted if summarization fails.
+Threads is accessed without signing in; a login wall skips that source for the
+run. CVE and hacking-related Threads posts are routed to the security channel.
+
+Before starting the service, run:
+
+```bash
+python3 -m newsroom_worker check
+python3 -m unittest discover -s tests -v
+python3 -m scripts.calibrate_newsroom
+```
+
+The check verifies the embedding endpoint and the bot's effective Discord
+permissions. Each feed channel must allow only the operational permissions it
+needs (`View Channel`, `Send Messages`, `Embed Links`, and `Read Message
+History`); it must not grant `Manage Channels`.
+
+The production unit template is `deploy/hd-newsroom-worker.service`. Install it
+as a user service and inspect logs with:
+
+```bash
+systemctl --user enable --now hd-newsroom-worker.service
+journalctl --user -u hd-newsroom-worker.service -f
+```
+
+Rollback is immediate: stop the newsroom unit. To roll back the music bot too,
+deploy the previous Git commit and restart `hd-music-bot.service`; both state
+files remain forward-compatible JSON and should be preserved.

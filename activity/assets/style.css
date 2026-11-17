@@ -1,0 +1,95 @@
+:root {
+  color-scheme: dark;
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+  background: #111218;
+  color: #f1f2f5;
+}
+
+* { box-sizing: border-box; }
+
+body { margin: 0; min-width: 320px; }
+
+main { margin: 0 auto; max-width: 1100px; padding: 24px; }
+
+header {
+  align-items: flex-start;
+  display: flex;
+  gap: 24px;
+  justify-content: space-between;
+  margin-bottom: 24px;
+}
+
+h1, h2, p { margin: 0; }
+h1 { font-size: 28px; }
+
+.eyebrow {
+  color: #a8b4ff;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: .12em;
+  margin-bottom: 4px;
+}
+
+#status {
+  color: #b5bac1;
+  font-size: 14px;
+  padding-top: 5px;
+  text-align: right;
+}
+
+.empty-state {
+  background: #1e1f29;
+  border: 1px dashed #4e5058;
+  border-radius: 16px;
+  padding: 56px 24px;
+  text-align: center;
+}
+
+.empty-state p { color: #b5bac1; margin-top: 12px; }
+
+code {
+  background: #2b2d39;
+  border-radius: 4px;
+  color: #fff;
+  padding: 2px 5px;
+}
+
+#player-section { margin: 0 auto; max-width: 960px; }
+
+#player {
+  aspect-ratio: 16 / 9;
+  background: #000;
+  border-radius: 12px;
+  overflow: hidden;
+  width: 100%;
+}
+
+#player iframe { height: 100%; width: 100%; }
+
+.controls {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  margin-top: 16px;
+}
+
+button {
+  background: #5865f2;
+  border: 0;
+  border-radius: 8px;
+  color: white;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 700;
+  min-width: 86px;
+  padding: 10px 14px;
+}
+
+button:hover { background: #4752c4; }
+#video-title { color: #dbdee1; margin-top: 16px; text-align: center; }
+
+@media (max-width: 600px) {
+  main { padding: 16px; }
+  header { display: block; }
+  #status { padding-top: 12px; text-align: left; }
+}

@@ -1,6 +1,18 @@
 .env
+.env.*
+!.env.example
+.env copy.example
 __pycache__/
 *.py[cod]
 .venv/
 venv/
 .DS_Store
+.pytest_cache/
+.ruff_cache/
+.coverage
+
+# Runtime state and generated media
+data/*
+!data/.gitkeep
+*.sqlite3
+*.wav

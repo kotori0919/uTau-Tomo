@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import datetime
 import html
 import io
 import json
+import logging
 import math
 import os
 import random
@@ -25,14 +27,39 @@ from urllib.parse import urljoin, urlparse
 import aiohttp
 import discord
 import yt_dlp
+from aiohttp import web
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
+
+
+log = logging.getLogger(__name__)
 
 try:
     from discord.ext import voice_recv
 except ImportError:
     voice_recv = None
+
+
+if voice_recv is not None:
+    class SafeVoiceRecvClient(voice_recv.VoiceRecvClient):
+        """Avoid a voice-recv crash when Discord reports a member leaving.
+
+        ``VoiceRecvClient`` receives participant SSRC events even before
+        ``listen()`` starts its audio reader.  The upstream implementation
+        dereferences that absent reader on a member-disconnect event, which
+        terminates discord.py's voice websocket polling task.
+        """
+
+        def _remove_ssrc(self, *, user_id: int) -> None:
+            ssrc = self._id_to_ssrc.pop(user_id, None)
+            if ssrc is None:
+                return
+            if self._reader:
+                self._reader.speaking_timer.drop_ssrc(ssrc)
+            self._ssrc_to_id.pop(ssrc, None)
+else:
+    SafeVoiceRecvClient = None
 
 
 load_dotenv()
@@ -42,28 +69,59 @@ OPUS_LIBRARY_PATH = os.getenv("OPUS_LIBRARY_PATH")
 PORT = os.getenv("PORT")
 HEALTH_HOST = os.getenv("HEALTH_HOST", "0.0.0.0")
 SYNC_GUILD_ID = os.getenv("DISCORD_GUILD_ID")
+ACTIVITY_PUBLIC_URL = os.getenv("ACTIVITY_PUBLIC_URL", "").rstrip("/")
+ACTIVITY_DIR = Path(__file__).with_name("activity")
 
-LLM_BACKEND = os.getenv("LLM_BACKEND", "ollama").strip().lower()
+LLM_BACKEND = os.getenv("LLM_BACKEND", "openai").strip().lower()
 LLM_URL = os.getenv(
-    "LLM_URL", os.getenv("OLLAMA_URL", "http://192.168.0.42:11434")
+    "LLM_URL", os.getenv("OLLAMA_URL", "https://monapi.kotori9.run/v1")
 ).rstrip("/")
 LLM_MODEL = os.getenv(
     "LLM_MODEL",
-    os.getenv("OLLAMA_MODEL", "SuperQwen-AgentWorld-35B-A3B:Q4"),
+    os.getenv("OLLAMA_MODEL", "deepseek-v4.1-flash"),
 )
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", os.getenv("OLLAMA_TIMEOUT", "180")))
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "2048"))
+LLM_NUM_CTX = int(os.getenv("LLM_NUM_CTX", "4096"))
+LLM_NUM_GPU = int(os.getenv("LLM_NUM_GPU", "999"))
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.2"))
+LLM_TOP_P = float(os.getenv("LLM_TOP_P", "0.75"))
+LLM_TOP_K = int(os.getenv("LLM_TOP_K", "30"))
 LLM_TOOL_MAX_STEPS = int(os.getenv("LLM_TOOL_MAX_STEPS", "2"))
-LLM_API_KEY = os.getenv("NIM_TOKEN") or os.getenv("NVIDIA_API_KEY") or os.getenv("LLM_API_KEY")
+LLM_API_KEY = (
+    os.getenv("LLM_API_KEY")
+    or os.getenv("NIM_TOKEN")
+    or os.getenv("NVIDIA_API_KEY")
+)
+LLM_THINK = os.getenv("LLM_THINK", "medium").strip().lower()
+LLM_THINK_RETRY_CHARS = int(os.getenv("LLM_THINK_RETRY_CHARS", "1200"))
+LLM_THINK_RETRY_SECONDS = float(os.getenv("LLM_THINK_RETRY_SECONDS", "14"))
+DEFAULT_LLM_STOP_SEQUENCES = (
+    "<|im_end|>",
+    "<|endoftext|>",
+    "<|eot_id|>",
+    "<|end|>",
+    "<|end_of_turn|>",
+    "<end_of_turn>",
+    "\nUser:",
+    "\n사용자:",
+)
+LLM_STOP_SEQUENCES = tuple(
+    item
+    for item in (
+        os.getenv("LLM_STOP_SEQUENCES", ",".join(DEFAULT_LLM_STOP_SEQUENCES)).split(",")
+    )
+    if item
+)
 LLM_FALLBACK_ENABLED = os.getenv("LLM_FALLBACK_ENABLED", "false").lower() not in {
     "0",
     "false",
     "no",
 }
 LLM_FALLBACK_BACKEND = os.getenv("LLM_FALLBACK_BACKEND", "ollama").strip().lower()
-LLM_FALLBACK_URL = os.getenv("LLM_FALLBACK_URL", "http://192.168.0.42:11434").rstrip("/")
+LLM_FALLBACK_URL = os.getenv("LLM_FALLBACK_URL", "http://192.168.0.197:11434").rstrip("/")
 LLM_FALLBACK_MODEL = os.getenv(
-    "LLM_FALLBACK_MODEL", "SuperQwen-AgentWorld-35B-A3B:Q4"
+    "LLM_FALLBACK_MODEL", "Qwythos-v2-9B:Q5"
 )
 LLM_FALLBACK_TIMEOUT = int(os.getenv("LLM_FALLBACK_TIMEOUT", str(LLM_TIMEOUT)))
 AI_PROMPT_PATH = Path(os.getenv("AI_PROMPT_PATH", "ai_prompt.md"))
@@ -75,6 +133,12 @@ WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "true").lower() not in {
 WEB_SEARCH_MAX_RESULTS = int(os.getenv("WEB_SEARCH_MAX_RESULTS", "3"))
 MAX_PLAYLIST_TRACKS = int(os.getenv("MAX_PLAYLIST_TRACKS", "100"))
 VOICE_EMPTY_DISCONNECT_SECONDS = float(os.getenv("VOICE_EMPTY_DISCONNECT_SECONDS", "30"))
+# The default Android VR client currently returns Googlevideo audio URLs that
+# require a proof-of-origin token when FFmpeg opens them directly, resulting in
+# a 403.  The regular Android client provides URLs FFmpeg can play directly.
+YTDL_YOUTUBE_PLAYER_CLIENT = os.getenv(
+    "YTDL_YOUTUBE_PLAYER_CLIENT", "android"
+).strip() or "android"
 
 DATA_DIR = Path(os.getenv("BOT_DATA_DIR", "data"))
 MEMORY_DB_PATH = Path(os.getenv("MEMORY_DB_PATH", DATA_DIR / "memory.sqlite3"))
@@ -97,7 +161,15 @@ VOICE_MIN_BYTES = int(
     VOICE_SAMPLE_RATE * VOICE_CHANNELS * VOICE_SAMPLE_WIDTH * VOICE_MIN_SECONDS
 )
 
-IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+IMAGE_CONTENT_TYPE_SUFFIXES = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "image/bmp": ".bmp",
+}
 AUDIO_SUFFIXES = {".wav", ".mp3", ".m4a", ".ogg", ".flac"}
 
 if OPUS_LIBRARY_PATH:
@@ -112,10 +184,16 @@ YTDL_OPTIONS = {
     "no_warnings": True,
     "default_search": "auto",
     "source_address": "0.0.0.0",
+    "extractor_args": {
+        "youtube": {"player_client": [YTDL_YOUTUBE_PLAYER_CLIENT]},
+    },
 }
 
 FFMPEG_OPTIONS = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+    "before_options": (
+        "-reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 "
+        "-reconnect_on_network_error 1 -reconnect_delay_max 10"
+    ),
     "options": "-vn",
 }
 
@@ -135,6 +213,104 @@ class Track:
     stream_url: str
     webpage_url: str | None = None
     start_time: float = 0.0
+    show_video: bool = False
+
+
+@dataclass
+class WatchParty:
+    title: str = ""
+    video_url: str = ""
+    position: float = 0.0
+    playing: bool = False
+    updated_at: float = field(default_factory=time.monotonic)
+    clients: set[web.WebSocketResponse] = field(default_factory=set)
+
+
+class WatchPartyHub:
+    def __init__(self) -> None:
+        self.parties: dict[int, WatchParty] = {}
+        self.lock = asyncio.Lock()
+
+    @staticmethod
+    def payload(party: WatchParty) -> dict[str, object]:
+        position = party.position
+        if party.playing:
+            position += max(0.0, time.monotonic() - party.updated_at)
+        return {
+            "type": "state",
+            "title": party.title,
+            "video_url": party.video_url,
+            "position": position,
+            "playing": party.playing,
+        }
+
+    async def set_video(self, channel_id: int, title: str, video_url: str) -> None:
+        async with self.lock:
+            party = self.parties.setdefault(channel_id, WatchParty())
+            party.title = title
+            party.video_url = video_url
+            party.position = 0.0
+            party.playing = False
+            party.updated_at = time.monotonic()
+            payload = self.payload(party)
+        await self.broadcast(channel_id, payload)
+
+    async def join(self, channel_id: int, client: web.WebSocketResponse) -> None:
+        async with self.lock:
+            party = self.parties.setdefault(channel_id, WatchParty())
+            party.clients.add(client)
+            payload = self.payload(party)
+        await client.send_json(payload)
+
+    async def leave(self, channel_id: int | None, client: web.WebSocketResponse) -> None:
+        if channel_id is None:
+            return
+        async with self.lock:
+            party = self.parties.get(channel_id)
+            if party is not None:
+                party.clients.discard(client)
+
+    async def update(
+        self, channel_id: int, position: object, playing: object
+    ) -> None:
+        if not isinstance(position, (int, float)) or isinstance(position, bool):
+            return
+        if not isinstance(playing, bool):
+            return
+
+        async with self.lock:
+            party = self.parties.setdefault(channel_id, WatchParty())
+            party.position = max(0.0, min(float(position), 86_400.0))
+            party.playing = playing
+            party.updated_at = time.monotonic()
+            payload = self.payload(party)
+        await self.broadcast(channel_id, payload)
+
+    async def broadcast(self, channel_id: int, payload: dict[str, object]) -> None:
+        async with self.lock:
+            party = self.parties.get(channel_id)
+            if party is None:
+                return
+            clients = tuple(client for client in party.clients if not client.closed)
+
+        if not clients:
+            return
+        results = await asyncio.gather(
+            *(client.send_json(payload) for client in clients), return_exceptions=True
+        )
+        failed = {
+            client
+            for client, result in zip(clients, results)
+            if isinstance(result, Exception) or client.closed
+        }
+        if failed:
+            async with self.lock:
+                party = self.parties.get(channel_id)
+                if party is not None:
+                    party.clients.difference_update(failed)
+
+
+watch_party_hub = WatchPartyHub()
 
 
 @dataclass
@@ -313,8 +489,43 @@ class DiscordStreamEditor:
 
 
 def clean_model_response(text: str) -> str:
+    text = strip_completion_markers(text)
     text = strip_reasoning_output(text)
+    text = strip_completion_markers(text)
+    text = normalize_foreign_fragments(text)
     return sanitize_discord_markdown(text)
+
+
+def normalize_foreign_fragments(text: str) -> str:
+    replacements = {
+        "经济实力": "경제력",
+        "經濟實力": "경제력",
+        "住的": "사는",
+    }
+    for source, replacement in replacements.items():
+        text = text.replace(source, replacement)
+    text = re.sub(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+", "", text)
+    text = re.sub(r"([가-힣])경제력", r"\1 경제력", text)
+    text = re.sub(r"([가-힣])사는", r"\1 사는", text)
+    text = text.replace("그런인", "그런")
+    text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+    text = re.sub(r" {2,}", " ", text)
+    return text
+
+
+def strip_completion_markers(text: str) -> str:
+    first_index: int | None = None
+    for marker in LLM_STOP_SEQUENCES:
+        index = text.find(marker)
+        if index >= 0 and (first_index is None or index < first_index):
+            first_index = index
+    if first_index is not None:
+        text = text[:first_index]
+    return text
+
+
+def has_completion_marker(text: str) -> bool:
+    return any(marker in text for marker in LLM_STOP_SEQUENCES)
 
 
 def strip_reasoning_output(text: str) -> str:
@@ -351,8 +562,12 @@ def strip_reasoning_output(text: str) -> str:
             text,
         )
 
-    text = re.sub(r"<\|channel\>thought.*?<channel\|>", "", text, flags=re.DOTALL)
-    text = re.sub(r"<\|channel\>final\n?", "", text)
+    text = re.sub(
+        r"(?is)<\|channel\|>(?:analysis|thought|reasoning|commentary).*?(?=<\|channel\|>final|$)",
+        "",
+        text,
+    )
+    text = re.sub(r"(?is)<\|channel\|>final\s*(?:<\|message\|>)?", "", text)
     text = re.sub(r"<\|[^>\n]+?\|>", "", text)
     text = text.replace("<channel|>", "")
     return text.strip()
@@ -366,10 +581,30 @@ def is_reasoning_stream_in_progress(raw_text: str) -> bool:
     if any(re.search(pattern, raw_text) for pattern in final_label_patterns):
         return False
 
+    has_open_think = re.search(r"(?is)<think\b[^>]*>", raw_text)
+    if has_open_think and not re.search(r"(?is)</think>", raw_text[has_open_think.start() :]):
+        return True
+
+    has_open_reasoning_tag = re.search(
+        r"(?is)<(?:reasoning|analysis|thought)\b[^>]*>", raw_text
+    )
+    if has_open_reasoning_tag and not re.search(
+        r"(?is)</(?:reasoning|analysis|thought)>",
+        raw_text[has_open_reasoning_tag.start() :],
+    ):
+        return True
+
+    cleaned = clean_model_response(raw_text)
+    if cleaned:
+        return False
+
     return bool(
-        re.search(r"(?is)<think\b[^>]*>", raw_text)
-        or re.search(
+        re.search(
             r"(?im)^\s*(?:\*\*|__)?\s*(?:reasoning|analysis|thought process|chain of thought|thinking|추론|사고 과정)\s*(?:\*\*|__)?\s*[:：]",
+            raw_text,
+        )
+        or re.search(
+            r"(?is)<\|channel\|>(?:analysis|thought|reasoning|commentary)",
             raw_text,
         )
     )
@@ -434,19 +669,139 @@ def sanitize_discord_markdown(text: str) -> str:
     return "\n".join(sanitized_lines).strip()
 
 
-def extract_json_object(text: str) -> dict[str, object] | None:
+def extract_json_objects(text: str) -> list[dict[str, object]]:
     text = text.strip()
+    text = re.sub(r"(?is)<tool_call>\s*", "", text)
+    text = re.sub(r"(?is)\s*</tool_call>", "", text)
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s*```$", "", text)
     decoder = json.JSONDecoder()
+    objects: list[dict[str, object]] = []
     for match in re.finditer(r"\{", text):
         try:
             value, _end = decoder.raw_decode(text[match.start() :])
         except json.JSONDecodeError:
             continue
         if isinstance(value, dict):
-            return value
+            objects.append(value)
+    return objects
+
+
+def extract_json_object(text: str) -> dict[str, object] | None:
+    objects = extract_json_objects(text)
+    return objects[0] if objects else None
+
+
+def parse_tool_arguments(value: object) -> dict[str, object]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
+def normalize_tool_call(
+    data: dict[str, object], tool_names: set[str]
+) -> dict[str, object] | None:
+    candidates: list[dict[str, object]] = [data]
+    for key in ("tool_call", "function_call", "call"):
+        value = data.get(key)
+        if isinstance(value, dict):
+            candidates.append(value)
+
+    tool_calls = data.get("tool_calls")
+    if isinstance(tool_calls, list):
+        candidates.extend(item for item in tool_calls if isinstance(item, dict))
+
+    function_value = data.get("function")
+    if isinstance(function_value, dict):
+        candidates.append(function_value)
+
+    for candidate in candidates:
+        nested_function = candidate.get("function")
+        if isinstance(nested_function, dict):
+            candidates.append(nested_function)
+
+        raw_name = (
+            candidate.get("tool")
+            or candidate.get("name")
+            or candidate.get("tool_name")
+            or candidate.get("function_name")
+            or candidate.get("action")
+        )
+        if isinstance(raw_name, dict):
+            raw_name = raw_name.get("name")
+        tool = str(raw_name or "").strip().lower()
+        if tool not in tool_names:
+            continue
+
+        arguments = parse_tool_arguments(
+            candidate.get("arguments")
+            or candidate.get("parameters")
+            or candidate.get("args")
+            or candidate.get("input")
+        )
+        normalized = {
+            key: value
+            for key, value in candidate.items()
+            if key
+            not in {
+                "tool",
+                "name",
+                "tool_name",
+                "function_name",
+                "function",
+                "function_call",
+                "tool_call",
+                "tool_calls",
+                "arguments",
+                "parameters",
+                "args",
+                "input",
+                "type",
+            }
+        }
+        normalized.update(arguments)
+        normalized["tool"] = tool
+        return normalized
+
     return None
+
+
+def is_tool_call_preview(text: str, tool_names: set[str]) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+
+    upper = stripped.upper()
+    if "WEB_SEARCH".startswith(upper) or upper.startswith("WEB_SEARCH"):
+        return True
+
+    if stripped.startswith("{") or re.match(r"(?is)^```json\b", stripped):
+        return True
+
+    for data in extract_json_objects(stripped):
+        if normalize_tool_call(data, tool_names):
+            return True
+
+    json_start = stripped.find("{")
+    if json_start >= 0:
+        candidate = stripped[json_start:]
+        if re.search(
+            r"""(?is)["'](?:tool|name|tool_name|function_name|function|tool_call|tool_calls)["']\s*:""",
+            candidate,
+        ):
+            return True
+        lowered = candidate.lower()
+        if any(name in lowered for name in tool_names):
+            return True
+
+    return False
 
 
 def parse_timestamp(value: str) -> float:
@@ -888,8 +1243,8 @@ PIKU_EXPORT_SCRIPT = r"""(async () => {
 
   const startButton = document.querySelector("#rstart");
   if (startButton && visible(startButton) && !visible(document.querySelector("#wleft"))) {
-    startButton.click();
-    await sleep(2000);
+    alert("아직 라운드 선택 화면이에요. PIKU에서 직접 '시작하기'를 눌러 A vs B 대진 화면이 뜬 뒤, 이 스크립트를 다시 실행해 주세요.");
+    return;
   }
 
   let attempts = 0;
@@ -1660,23 +2015,59 @@ class LLMClient:
         self.api_key = api_key
         self.max_tokens = max_tokens
 
+    def chat_messages_from_prompt(
+        self, prompt: str, *, media_paths: list[Path] | None = None
+    ) -> list[dict[str, object]]:
+        marker = "\n[Current request]\n"
+        if marker in prompt:
+            system_content, user_content = prompt.split(marker, 1)
+            messages: list[dict[str, object]] = [
+                {"role": "system", "content": system_content.strip()},
+                {"role": "user", "content": user_content.strip()},
+            ]
+        else:
+            messages = [{"role": "user", "content": prompt}]
+
+        image_payloads = [
+            base64.b64encode(path.read_bytes()).decode("ascii")
+            for path in media_paths or []
+            if path.suffix.lower() in IMAGE_SUFFIXES
+        ]
+        if image_payloads:
+            messages[-1]["images"] = image_payloads
+        return messages
+
     def build_ollama_payload(
         self,
         prompt: str,
         *,
         media_paths: list[Path] | None = None,
         stream: bool = False,
+        think: object | None = None,
     ) -> dict[str, object]:
         payload: dict[str, object] = {
             "model": self.model,
             "prompt": prompt,
             "stream": stream,
             "options": {
-                "temperature": 1.0,
-                "top_p": 0.95,
-                "top_k": 64,
+                "temperature": LLM_TEMPERATURE,
+                "top_p": LLM_TOP_P,
+                "top_k": LLM_TOP_K,
+                "num_ctx": LLM_NUM_CTX,
+                "num_predict": self.max_tokens,
+                "num_gpu": LLM_NUM_GPU,
+                "stop": list(LLM_STOP_SEQUENCES),
             },
         }
+        think_setting = LLM_THINK if think is None else think
+        if isinstance(think_setting, bool):
+            payload["think"] = think_setting
+        elif think_setting in {"0", "false", "no", "off"}:
+            payload["think"] = False
+        elif think_setting in {"1", "true", "yes", "on"}:
+            payload["think"] = True
+        elif think_setting:
+            payload["think"] = think_setting
         if media_paths:
             payload["images"] = [
                 base64.b64encode(path.read_bytes()).decode("ascii")
@@ -1684,15 +2075,48 @@ class LLMClient:
             ]
         return payload
 
+    def build_ollama_chat_payload(
+        self,
+        prompt: str,
+        *,
+        media_paths: list[Path] | None = None,
+        stream: bool = False,
+        think: object | None = None,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "model": self.model,
+            "messages": self.chat_messages_from_prompt(prompt, media_paths=media_paths),
+            "stream": stream,
+            "options": {
+                "temperature": LLM_TEMPERATURE,
+                "top_p": LLM_TOP_P,
+                "top_k": LLM_TOP_K,
+                "num_ctx": LLM_NUM_CTX,
+                "num_predict": self.max_tokens,
+                "num_gpu": LLM_NUM_GPU,
+                "stop": list(LLM_STOP_SEQUENCES),
+            },
+        }
+        think_setting = LLM_THINK if think is None else think
+        if isinstance(think_setting, bool):
+            payload["think"] = think_setting
+        elif think_setting in {"0", "false", "no", "off"}:
+            payload["think"] = False
+        elif think_setting in {"1", "true", "yes", "on"}:
+            payload["think"] = True
+        elif think_setting:
+            payload["think"] = think_setting
+        return payload
+
     def build_openai_payload(
         self, prompt: str, *, stream: bool = False
     ) -> dict[str, object]:
         return {
             "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": self.chat_messages_from_prompt(prompt),
             "stream": stream,
-            "temperature": 1.0,
-            "top_p": 0.95,
+            "temperature": LLM_TEMPERATURE,
+            "top_p": LLM_TOP_P,
             "max_tokens": self.max_tokens,
         }
 
@@ -1721,28 +2145,53 @@ class LLMClient:
     async def generate_ollama(
         self, prompt: str, *, media_paths: list[Path] | None = None
     ) -> str:
-        payload = self.build_ollama_payload(
-            prompt, media_paths=media_paths, stream=False
+        return await self.generate_ollama_with_think(
+            prompt, media_paths=media_paths, think=None
+        )
+
+    async def generate_ollama_with_think(
+        self,
+        prompt: str,
+        *,
+        media_paths: list[Path] | None = None,
+        think: object | None = None,
+    ) -> str:
+        payload = self.build_ollama_chat_payload(
+            prompt, media_paths=media_paths, stream=False, think=think
         )
         timeout = aiohttp.ClientTimeout(total=self.timeout)
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
-                    f"{self.base_url}/api/generate", json=payload
+                    f"{self.base_url}/api/chat", json=payload
                 ) as response:
                     if response.status >= 400:
                         body = await response.text()
                         raise AIError(f"Ollama 오류 {response.status}: {body[:300]}")
                     data = await response.json()
         except asyncio.TimeoutError as exc:
+            if payload.get("think") is not False:
+                return await self.generate_ollama_with_think(
+                    prompt, media_paths=media_paths, think=False
+                )
             raise AIError("Ollama 응답 시간이 초과됐어요.") from exc
         except aiohttp.ClientError as exc:
+            if payload.get("think") is not False:
+                return await self.generate_ollama_with_think(
+                    prompt, media_paths=media_paths, think=False
+                )
             raise AIError(f"Ollama 서버에 연결하지 못했어요: {exc}") from exc
 
-        answer = data.get("response", "")
-        if not isinstance(answer, str) or not answer.strip():
+        message = data.get("message") if isinstance(data, dict) else None
+        answer = message.get("content", "") if isinstance(message, dict) else ""
+        cleaned = clean_model_response(answer) if isinstance(answer, str) else ""
+        if not cleaned and payload.get("think") is not False:
+            return await self.generate_ollama_with_think(
+                prompt, media_paths=media_paths, think=False
+            )
+        if not cleaned:
             raise AIError("Ollama가 빈 응답을 반환했어요.")
-        return clean_model_response(answer)
+        return cleaned
 
     async def generate_openai_compat(self, prompt: str) -> str:
         if self.backend == "nim" and not self.api_key:
@@ -1763,7 +2212,7 @@ class LLMClient:
         except asyncio.TimeoutError as exc:
             raise AIError("LLM 응답 시간이 초과됐어요.") from exc
         except aiohttp.ClientError as exc:
-            raise AIError(f"LLM 서버에 연결하지 못했어요: {exc}") from exc
+            raise AIError(f"LLM 서버에 연결하지 못했어요 잔넨데시타~!") from exc
 
         try:
             answer = data["choices"][0]["message"]["content"]
@@ -1793,13 +2242,30 @@ class LLMClient:
         media_paths: list[Path] | None = None,
         on_update: StreamCallback | None = None,
     ) -> str:
-        payload = self.build_ollama_payload(prompt, media_paths=media_paths, stream=True)
+        return await self.generate_ollama_stream_with_think(
+            prompt, media_paths=media_paths, on_update=on_update, think=None
+        )
+
+    async def generate_ollama_stream_with_think(
+        self,
+        prompt: str,
+        *,
+        media_paths: list[Path] | None = None,
+        on_update: StreamCallback | None = None,
+        think: object | None = None,
+    ) -> str:
+        payload = self.build_ollama_chat_payload(
+            prompt, media_paths=media_paths, stream=True, think=think
+        )
         timeout = aiohttp.ClientTimeout(total=self.timeout)
         chunks: list[str] = []
+        thinking_chars = 0
+        started_at = time.monotonic()
+        retry_without_thinking = False
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
-                    f"{self.base_url}/api/generate", json=payload
+                    f"{self.base_url}/api/chat", json=payload
                 ) as response:
                     if response.status >= 400:
                         body = await response.text()
@@ -1814,24 +2280,61 @@ class LLMClient:
                         except json.JSONDecodeError:
                             continue
 
-                        token = data.get("response", "")
+                        message = data.get("message") if isinstance(data, dict) else None
+                        token = message.get("content", "") if isinstance(message, dict) else ""
+                        thinking = message.get("thinking", "") if isinstance(message, dict) else ""
+                        if isinstance(thinking, str) and thinking:
+                            thinking_chars += len(thinking)
                         if isinstance(token, str) and token:
                             chunks.append(token)
+                            raw_text = "".join(chunks)
                             if on_update:
-                                raw_text = "".join(chunks)
                                 if not is_reasoning_stream_in_progress(raw_text):
                                     cleaned = clean_model_response(raw_text)
                                     if cleaned:
                                         await on_update(cleaned)
+                            if has_completion_marker(raw_text):
+                                break
+                        elif (
+                            payload.get("think") is not False
+                            and not chunks
+                            and (
+                                thinking_chars >= LLM_THINK_RETRY_CHARS
+                                or time.monotonic() - started_at >= LLM_THINK_RETRY_SECONDS
+                            )
+                        ):
+                            retry_without_thinking = True
+                            break
 
                         if data.get("done"):
                             break
         except asyncio.TimeoutError as exc:
+            if payload.get("think") is not False:
+                return await self.generate_ollama_stream_with_think(
+                    prompt,
+                    media_paths=media_paths,
+                    on_update=on_update,
+                    think=False,
+                )
             raise AIError("Ollama 응답 시간이 초과됐어요.") from exc
         except aiohttp.ClientError as exc:
-            raise AIError(f"Ollama 서버에 연결하지 못했어요: {exc}") from exc
+            if payload.get("think") is not False:
+                return await self.generate_ollama_stream_with_think(
+                    prompt,
+                    media_paths=media_paths,
+                    on_update=on_update,
+                    think=False,
+                )
+            raise AIError(f"Ollama 서버에 연결하지 못했어요 잔넨~") from exc
 
         answer = clean_model_response("".join(chunks))
+        if (retry_without_thinking or not answer) and payload.get("think") is not False:
+            return await self.generate_ollama_stream_with_think(
+                prompt,
+                media_paths=media_paths,
+                on_update=on_update,
+                think=False,
+            )
         if not answer:
             raise AIError("Ollama가 빈 응답을 반환했어요.")
         return answer
@@ -1872,12 +2375,14 @@ class LLMClient:
                             token = ""
                         if token:
                             chunks.append(token)
+                            raw_text = "".join(chunks)
                             if on_update:
-                                raw_text = "".join(chunks)
                                 if not is_reasoning_stream_in_progress(raw_text):
                                     cleaned = clean_model_response(raw_text)
                                     if cleaned:
                                         await on_update(cleaned)
+                            if has_completion_marker(raw_text):
+                                break
         except asyncio.TimeoutError as exc:
             raise AIError("LLM 응답 시간이 초과됐어요.") from exc
         except aiohttp.ClientError as exc:
@@ -2190,6 +2695,512 @@ class DiscordContextTool(AITool):
         return max(1, min(limit, 50 if is_admin else 20))
 
 
+class DiscordModerationTool(AITool):
+    name = "discord_moderation"
+    description = "Run Discord moderation actions for administrators: timeout, remove timeout, kick, ban, or unban. Requires real Discord admin permission and bot permission."
+    schema = '{"tool":"discord_moderation","action":"timeout|untimeout|kick|ban|unban","user_id":"mention/id/name","duration":"10m|1h|1d for timeout","reason":"reason","delete_message_days":0}'
+    admin_only = True
+
+    async def run(
+        self, context: ToolExecutionContext, arguments: dict[str, object]
+    ) -> ToolResult:
+        action = str(arguments.get("action") or "").strip().lower()
+        reason = str(arguments.get("reason") or "관리자 LLM 도구 요청").strip()[:450]
+        if action in {"remove_timeout", "clear_timeout", "untimeout"}:
+            action = "untimeout"
+        if action not in {"timeout", "untimeout", "kick", "ban", "unban"}:
+            return ToolResult("지원하는 moderation action은 timeout, untimeout, kick, ban, unban입니다.", final=True)
+
+        bot_member = context.guild.me
+        if bot_member is None:
+            return ToolResult("봇의 서버 멤버 정보를 찾지 못해서 moderation을 실행하지 못했어요.", final=True)
+
+        if action == "unban":
+            return await self.unban_user(context, arguments, reason, bot_member)
+
+        member = self.resolve_member(context.guild, arguments.get("user_id") or arguments.get("user"))
+        if member is None:
+            return ToolResult("대상 유저를 찾지 못했어요. 멘션이나 유저 ID를 포함해 주세요.", final=True)
+        allowed = self.validate_member_action(context, bot_member, member, action)
+        if allowed:
+            return ToolResult(allowed, final=True)
+
+        try:
+            if action == "timeout":
+                duration = self.parse_duration(arguments.get("duration"))
+                if duration is None:
+                    return ToolResult("timeout duration을 `10m`, `1h`, `1d`처럼 지정해 주세요.", final=True)
+                until = discord.utils.utcnow() + duration
+                await member.timeout(until, reason=reason)
+                text = f"{member.display_name} 님을 {self.format_duration(duration)} 동안 타임아웃했어요. 사유: {reason}"
+            elif action == "untimeout":
+                await member.timeout(None, reason=reason)
+                text = f"{member.display_name} 님의 타임아웃을 해제했어요. 사유: {reason}"
+            elif action == "kick":
+                await member.kick(reason=reason)
+                text = f"{member.display_name} 님을 서버에서 내보냈어요. 사유: {reason}"
+            else:
+                delete_days = self.parse_delete_days(arguments.get("delete_message_days"))
+                await member.ban(reason=reason, delete_message_days=delete_days)
+                text = f"{member.display_name} 님을 차단했어요. 사유: {reason}"
+        except discord.Forbidden:
+            return ToolResult("봇 권한이나 역할 순서 때문에 moderation을 실행하지 못했어요.", final=True)
+        except discord.HTTPException as exc:
+            return ToolResult(f"Discord API 오류로 moderation을 실행하지 못했어요: {exc}", final=True)
+
+        if context.messageable is not None:
+            try:
+                await context.messageable.send(text)
+            except discord.HTTPException:
+                pass
+        return ToolResult(text, final=True)
+
+    async def unban_user(
+        self,
+        context: ToolExecutionContext,
+        arguments: dict[str, object],
+        reason: str,
+        bot_member: discord.Member,
+    ) -> ToolResult:
+        if not bot_member.guild_permissions.ban_members:
+            return ToolResult("봇에 Ban Members 권한이 없어서 unban을 실행하지 못했어요.", final=True)
+        user_id = self.parse_user_id(arguments.get("user_id") or arguments.get("user"))
+        if user_id is None:
+            return ToolResult("unban은 대상 유저 ID가 필요해요.", final=True)
+        try:
+            user = await context.bot.fetch_user(user_id)
+            await context.guild.unban(user, reason=reason)
+        except discord.NotFound:
+            return ToolResult("해당 유저의 차단 기록을 찾지 못했어요.", final=True)
+        except discord.Forbidden:
+            return ToolResult("봇 권한 때문에 unban을 실행하지 못했어요.", final=True)
+        except discord.HTTPException as exc:
+            return ToolResult(f"Discord API 오류로 unban을 실행하지 못했어요: {exc}", final=True)
+        text = f"{user} 님의 차단을 해제했어요. 사유: {reason}"
+        if context.messageable is not None:
+            try:
+                await context.messageable.send(text)
+            except discord.HTTPException:
+                pass
+        return ToolResult(text, final=True)
+
+    def validate_member_action(
+        self,
+        context: ToolExecutionContext,
+        bot_member: discord.Member,
+        target: discord.Member,
+        action: str,
+    ) -> str | None:
+        permissions = bot_member.guild_permissions
+        if action in {"timeout", "untimeout"} and not permissions.moderate_members:
+            return "봇에 Moderate Members 권한이 없어서 timeout을 실행하지 못했어요."
+        if action == "kick" and not permissions.kick_members:
+            return "봇에 Kick Members 권한이 없어서 kick을 실행하지 못했어요."
+        if action == "ban" and not permissions.ban_members:
+            return "봇에 Ban Members 권한이 없어서 ban을 실행하지 못했어요."
+        if target.id == context.guild.owner_id:
+            return "서버 소유자에게는 moderation을 실행할 수 없어요."
+        if target.id == context.bot.user.id:
+            return "봇 자기 자신에게는 moderation을 실행하지 않을게요."
+        if target.id == context.user.id:
+            return "요청자 본인에게 moderation을 실행하지 않을게요."
+        if target.top_role >= bot_member.top_role:
+            return "대상 유저의 역할이 봇 역할보다 같거나 높아서 실행할 수 없어요."
+        actor = context.user if isinstance(context.user, discord.Member) else None
+        if actor and actor.id != context.guild.owner_id and target.top_role >= actor.top_role:
+            return "대상 유저의 역할이 요청자 역할보다 같거나 높아서 실행할 수 없어요."
+        return None
+
+    def resolve_member(self, guild: discord.Guild, value: object) -> discord.Member | None:
+        user_id = self.parse_user_id(value)
+        if user_id is not None:
+            member = guild.get_member(user_id)
+            if member is not None:
+                return member
+        raw = str(value or "").strip().lower()
+        if not raw:
+            return None
+        for member in guild.members:
+            if raw in {member.name.lower(), member.display_name.lower(), str(member.id)}:
+                return member
+        return None
+
+    def parse_user_id(self, value: object) -> int | None:
+        match = re.search(r"\d{15,25}", str(value or ""))
+        return int(match.group(0)) if match else None
+
+    def parse_delete_days(self, value: object) -> int:
+        try:
+            days = int(value)
+        except (TypeError, ValueError):
+            days = 0
+        return max(0, min(days, 7))
+
+    def parse_duration(self, value: object) -> datetime.timedelta | None:
+        raw = str(value or "").strip().lower()
+        if not raw:
+            return None
+        if raw.isdigit():
+            seconds = int(raw)
+        else:
+            seconds = 0
+            for amount, unit in re.findall(r"(\d+)\s*(d|day|days|h|hr|hour|hours|m|min|minute|minutes|s|sec|second|seconds)", raw):
+                number = int(amount)
+                if unit.startswith("d"):
+                    seconds += number * 86400
+                elif unit.startswith("h"):
+                    seconds += number * 3600
+                elif unit.startswith("m"):
+                    seconds += number * 60
+                else:
+                    seconds += number
+        if seconds <= 0:
+            return None
+        return datetime.timedelta(seconds=min(seconds, 28 * 86400))
+
+    def format_duration(self, duration: datetime.timedelta) -> str:
+        seconds = int(duration.total_seconds())
+        days, seconds = divmod(seconds, 86400)
+        hours, seconds = divmod(seconds, 3600)
+        minutes, seconds = divmod(seconds, 60)
+        parts = []
+        if days:
+            parts.append(f"{days}일")
+        if hours:
+            parts.append(f"{hours}시간")
+        if minutes:
+            parts.append(f"{minutes}분")
+        if seconds and not parts:
+            parts.append(f"{seconds}초")
+        return " ".join(parts) or "0초"
+
+
+class DiscordActionTool(AITool):
+    name = "discord_action"
+    description = "Run Discord channel/message actions. Use for polls/votes when options are known, send/edit/delete messages, create/edit threads, pin/unpin messages, add reactions, and mention users/roles."
+    schema = '{"tool":"discord_action","action":"send_message|edit_message|delete_message|create_thread|edit_thread|pin_message|unpin_message|add_reaction|mention|create_poll","channel_id":"optional","message_id":"optional","thread_id":"optional","content":"text","user_ids":["optional"],"role_ids":["optional"],"everyone":false,"poll":{"question":"질문","answers":["A","B"],"duration":"1h","multiple":false},"name":"thread name","emoji":"👍","reason":"optional"}'
+    admin_only = True
+
+    async def run(
+        self, context: ToolExecutionContext, arguments: dict[str, object]
+    ) -> ToolResult:
+        action = str(arguments.get("action") or "").strip().lower()
+        aliases = {
+            "send": "send_message",
+            "reply": "send_message",
+            "poll": "create_poll",
+            "thread": "create_thread",
+            "pin": "pin_message",
+            "unpin": "unpin_message",
+            "react": "add_reaction",
+            "reaction": "add_reaction",
+        }
+        action = aliases.get(action, action)
+        try:
+            if action in {"send_message", "mention", "create_poll"}:
+                return await self.send_message(context, arguments, action)
+            if action == "edit_message":
+                return await self.edit_message(context, arguments)
+            if action == "delete_message":
+                return await self.delete_message(context, arguments)
+            if action == "create_thread":
+                return await self.create_thread(context, arguments)
+            if action == "edit_thread":
+                return await self.edit_thread(context, arguments)
+            if action in {"pin_message", "unpin_message"}:
+                return await self.pin_message(context, arguments, pin=action == "pin_message")
+            if action == "add_reaction":
+                return await self.add_reaction(context, arguments)
+        except discord.Forbidden:
+            return ToolResult("봇 권한이 부족해서 Discord 작업을 실행하지 못했어요.", final=True)
+        except discord.NotFound:
+            return ToolResult("대상 채널, 메시지, 스레드, 유저, 또는 역할을 찾지 못했어요.", final=True)
+        except discord.HTTPException as exc:
+            return ToolResult(f"Discord API 오류로 작업을 실행하지 못했어요: {exc}", final=True)
+        except ValueError as exc:
+            return ToolResult(str(exc), final=True)
+        return ToolResult(f"알 수 없는 discord_action action입니다: {action}", final=True)
+
+    async def send_message(
+        self,
+        context: ToolExecutionContext,
+        arguments: dict[str, object],
+        action: str,
+    ) -> ToolResult:
+        channel = self.resolve_send_channel(context, arguments)
+        if channel is None:
+            return ToolResult("메시지를 보낼 채널을 찾지 못했어요.", final=True)
+
+        content = str(arguments.get("content") or "").strip()
+        if action == "mention":
+            content = self.build_mention_content(context, arguments, content)
+
+        poll = self.build_poll(arguments) if action == "create_poll" else None
+        if poll is not None and not content:
+            content = "투표를 시작했어요."
+        if not content and poll is None:
+            return ToolResult("보낼 메시지 내용이나 poll 정보가 필요해요.", final=True)
+
+        reference = None
+        reply_to = self.parse_int(arguments.get("reply_to_message_id"))
+        if reply_to is not None and hasattr(channel, "fetch_message"):
+            reference = await channel.fetch_message(reply_to)
+
+        message = await channel.send(
+            content[:1900],
+            allowed_mentions=self.allowed_mentions(context, arguments),
+            reference=reference,
+            mention_author=self.parse_bool(arguments.get("mention_author"), False),
+            silent=self.parse_bool(arguments.get("silent"), False),
+            suppress_embeds=self.parse_bool(arguments.get("suppress_embeds"), False),
+            poll=poll,
+        )
+        return ToolResult(f"Discord 메시지를 보냈어요. message_id={message.id}", final=True)
+
+    async def edit_message(
+        self, context: ToolExecutionContext, arguments: dict[str, object]
+    ) -> ToolResult:
+        message = await self.resolve_message(context, arguments)
+        content = str(arguments.get("content") or "").strip()
+        if not content:
+            return ToolResult("수정할 메시지 내용이 필요해요.", final=True)
+        await message.edit(
+            content=content[:1900],
+            allowed_mentions=self.allowed_mentions(context, arguments),
+        )
+        return ToolResult(f"메시지를 수정했어요. message_id={message.id}", final=True)
+
+    async def delete_message(
+        self, context: ToolExecutionContext, arguments: dict[str, object]
+    ) -> ToolResult:
+        message = await self.resolve_message(context, arguments)
+        await message.delete()
+        return ToolResult(f"메시지를 삭제했어요. message_id={message.id}", final=True)
+
+    async def create_thread(
+        self, context: ToolExecutionContext, arguments: dict[str, object]
+    ) -> ToolResult:
+        name = str(arguments.get("name") or arguments.get("title") or "").strip()[:100]
+        if not name:
+            return ToolResult("스레드 이름이 필요해요.", final=True)
+        channel = self.resolve_channel(context, arguments.get("channel_id"))
+        if channel is None:
+            return ToolResult("스레드를 만들 채널을 찾지 못했어요.", final=True)
+        reason = str(arguments.get("reason") or "LLM Discord action").strip()[:450]
+        slowmode = self.parse_int(arguments.get("slowmode_delay"))
+        auto_archive = self.parse_auto_archive(arguments.get("auto_archive_duration"))
+
+        message_id = self.parse_int(arguments.get("message_id"))
+        if isinstance(channel, discord.ForumChannel):
+            content = str(arguments.get("content") or "스레드를 시작했어요.").strip()[:1900]
+            created = await channel.create_thread(
+                name=name,
+                content=content,
+                auto_archive_duration=auto_archive,
+                slowmode_delay=slowmode,
+                reason=reason,
+            )
+            thread = created.thread
+        elif message_id is not None and hasattr(channel, "fetch_message"):
+            message = await channel.fetch_message(message_id)
+            thread = await message.create_thread(
+                name=name,
+                auto_archive_duration=auto_archive,
+                slowmode_delay=slowmode,
+                reason=reason,
+            )
+        elif hasattr(channel, "create_thread"):
+            thread = await channel.create_thread(
+                name=name,
+                auto_archive_duration=auto_archive,
+                slowmode_delay=slowmode,
+                reason=reason,
+            )
+        else:
+            return ToolResult("이 채널에서는 스레드를 만들 수 없어요.", final=True)
+        return ToolResult(f"스레드를 만들었어요. thread_id={thread.id}", final=True)
+
+    async def edit_thread(
+        self, context: ToolExecutionContext, arguments: dict[str, object]
+    ) -> ToolResult:
+        thread = self.resolve_thread(context, arguments)
+        if thread is None:
+            return ToolResult("수정할 스레드를 찾지 못했어요.", final=True)
+        options: dict[str, object] = {
+            "reason": str(arguments.get("reason") or "LLM Discord action").strip()[:450]
+        }
+        if arguments.get("name") is not None:
+            options["name"] = str(arguments.get("name")).strip()[:100]
+        for key in ("archived", "locked", "invitable", "pinned"):
+            if arguments.get(key) is not None:
+                options[key] = self.parse_bool(arguments.get(key), False)
+        if arguments.get("slowmode_delay") is not None:
+            options["slowmode_delay"] = self.parse_int(arguments.get("slowmode_delay")) or 0
+        if arguments.get("auto_archive_duration") is not None:
+            options["auto_archive_duration"] = self.parse_auto_archive(arguments.get("auto_archive_duration"))
+        await thread.edit(**options)
+        return ToolResult(f"스레드를 수정했어요. thread_id={thread.id}", final=True)
+
+    async def pin_message(
+        self,
+        context: ToolExecutionContext,
+        arguments: dict[str, object],
+        *,
+        pin: bool,
+    ) -> ToolResult:
+        message = await self.resolve_message(context, arguments)
+        reason = str(arguments.get("reason") or "LLM Discord action").strip()[:450]
+        if pin:
+            await message.pin(reason=reason)
+            return ToolResult(f"메시지를 고정했어요. message_id={message.id}", final=True)
+        await message.unpin(reason=reason)
+        return ToolResult(f"메시지 고정을 해제했어요. message_id={message.id}", final=True)
+
+    async def add_reaction(
+        self, context: ToolExecutionContext, arguments: dict[str, object]
+    ) -> ToolResult:
+        message = await self.resolve_message(context, arguments)
+        emoji = str(arguments.get("emoji") or "").strip()
+        if not emoji:
+            return ToolResult("추가할 emoji가 필요해요.", final=True)
+        await message.add_reaction(emoji)
+        return ToolResult(f"리액션을 추가했어요. message_id={message.id}", final=True)
+
+    def build_poll(self, arguments: dict[str, object]) -> discord.Poll | None:
+        raw_poll = arguments.get("poll")
+        poll_data = raw_poll if isinstance(raw_poll, dict) else arguments
+        question = str(poll_data.get("question") or arguments.get("question") or "").strip()
+        answers = self.parse_str_list(poll_data.get("answers") or arguments.get("answers"))
+        if not question and not answers:
+            return None
+        if not question or len(answers) < 2:
+            raise ValueError("poll에는 질문과 답변 2개 이상이 필요해요.")
+        duration = self.parse_duration(poll_data.get("duration") or arguments.get("duration") or "1h")
+        poll = discord.Poll(
+            question=question[:300],
+            duration=duration,
+            multiple=self.parse_bool(poll_data.get("multiple") or arguments.get("multiple"), False),
+        )
+        for answer in answers[:10]:
+            poll.add_answer(text=answer[:55])
+        return poll
+
+    def build_mention_content(
+        self, context: ToolExecutionContext, arguments: dict[str, object], content: str
+    ) -> str:
+        parts = []
+        if self.parse_bool(arguments.get("everyone"), False):
+            parts.append("@everyone")
+        parts.extend(f"<@{user_id}>" for user_id in self.parse_ids(arguments.get("user_ids") or arguments.get("user_id")))
+        parts.extend(f"<@&{role_id}>" for role_id in self.parse_ids(arguments.get("role_ids") or arguments.get("role_id")))
+        if not parts:
+            return content
+        return f"{' '.join(parts)} {content}".strip()
+
+    def allowed_mentions(
+        self, context: ToolExecutionContext, arguments: dict[str, object]
+    ) -> discord.AllowedMentions:
+        user_ids = self.parse_ids(arguments.get("user_ids") or arguments.get("user_id"))
+        role_ids = self.parse_ids(arguments.get("role_ids") or arguments.get("role_id"))
+        users = [member for user_id in user_ids if (member := context.guild.get_member(user_id))]
+        roles = [role for role_id in role_ids if (role := context.guild.get_role(role_id))]
+        return discord.AllowedMentions(
+            everyone=self.parse_bool(arguments.get("everyone"), False),
+            users=users if users else False,
+            roles=roles if roles else False,
+            replied_user=self.parse_bool(arguments.get("mention_author"), False),
+        )
+
+    def resolve_send_channel(
+        self, context: ToolExecutionContext, arguments: dict[str, object]
+    ) -> discord.abc.Messageable | None:
+        channel = self.resolve_channel(context, arguments.get("channel_id") or arguments.get("thread_id"))
+        if channel is not None and hasattr(channel, "send"):
+            return channel
+        return context.messageable if context.messageable is not None else context.guild.system_channel
+
+    def resolve_channel(
+        self, context: ToolExecutionContext, value: object
+    ) -> discord.abc.GuildChannel | discord.Thread | None:
+        channel_id = self.parse_int(value) or context.channel_id
+        channel = context.guild.get_channel(channel_id)
+        if channel is not None:
+            return channel
+        return context.guild.get_thread(channel_id)
+
+    def resolve_thread(
+        self, context: ToolExecutionContext, arguments: dict[str, object]
+    ) -> discord.Thread | None:
+        thread_id = self.parse_int(arguments.get("thread_id") or arguments.get("channel_id"))
+        if thread_id is None:
+            channel = context.guild.get_channel(context.channel_id)
+            return channel if isinstance(channel, discord.Thread) else None
+        return context.guild.get_thread(thread_id)
+
+    async def resolve_message(
+        self, context: ToolExecutionContext, arguments: dict[str, object]
+    ) -> discord.Message:
+        message_id = self.parse_int(arguments.get("message_id"))
+        if message_id is None:
+            raise ValueError("message_id가 필요해요.")
+        channel = self.resolve_channel(context, arguments.get("channel_id") or arguments.get("thread_id"))
+        if channel is None or not hasattr(channel, "fetch_message"):
+            raise ValueError("메시지를 찾을 채널을 찾지 못했어요.")
+        return await channel.fetch_message(message_id)
+
+    def parse_int(self, value: object) -> int | None:
+        if value is None:
+            return None
+        match = re.search(r"\d{1,25}", str(value))
+        return int(match.group(0)) if match else None
+
+    def parse_ids(self, value: object) -> list[int]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            values = value
+        else:
+            values = [value]
+        ids: list[int] = []
+        for item in values:
+            ids.extend(int(match.group(0)) for match in re.finditer(r"\d{15,25}", str(item)))
+        return ids
+
+    def parse_str_list(self, value: object) -> list[str]:
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        if isinstance(value, str):
+            return [part.strip() for part in re.split(r"[,|\n]", value) if part.strip()]
+        return []
+
+    def parse_bool(self, value: object, default: bool) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "yes", "y", "on", "허용", "예"}
+
+    def parse_duration(self, value: object) -> datetime.timedelta:
+        raw = str(value or "").strip().lower()
+        seconds = 0
+        for amount, unit in re.findall(r"(\d+)\s*(d|day|days|h|hr|hour|hours|m|min|minute|minutes)", raw):
+            number = int(amount)
+            if unit.startswith("d"):
+                seconds += number * 86400
+            elif unit.startswith("h"):
+                seconds += number * 3600
+            else:
+                seconds += number * 60
+        if seconds <= 0 and raw.isdigit():
+            seconds = int(raw) * 60
+        return datetime.timedelta(seconds=max(300, min(seconds or 3600, 7 * 86400)))
+
+    def parse_auto_archive(self, value: object) -> int:
+        minutes = self.parse_int(value) or 1440
+        allowed = (60, 1440, 4320, 10080)
+        return min(allowed, key=lambda option: abs(option - minutes))
+
+
 class MusicQueueTool(AITool):
     name = "music_queue"
     description = "Read the current music queue."
@@ -2307,7 +3318,9 @@ class AIConversationService:
             messageable=messageable,
         )
         tool_outputs: list[str] = []
+        seen_tool_calls: set[str] = set()
         answer = ""
+        needs_finalization = False
 
         for _step in range(max(1, LLM_TOOL_MAX_STEPS)):
             prompt = await self.build_prompt(
@@ -2324,15 +3337,7 @@ class AIConversationService:
             async def first_pass_update(text: str) -> None:
                 if not stream_callback:
                     return
-                stripped = text.strip().upper()
-                if not stripped:
-                    return
-                if stripped.startswith("{") or stripped.startswith("```JSON"):
-                    return
-                tool_call = extract_json_object(text)
-                if tool_call and str(tool_call.get("tool", "")).lower() in self.tool_registry.names():
-                    return
-                if "WEB_SEARCH".startswith(stripped) or stripped.startswith("WEB_SEARCH"):
+                if is_tool_call_preview(text, self.tool_registry.names()):
                     return
                 await stream_callback(text)
 
@@ -2351,8 +3356,43 @@ class AIConversationService:
             if not tool_call:
                 break
 
+            tool_name = str(tool_call.get("tool") or "unknown")
+            signature = json.dumps(tool_call, ensure_ascii=False, sort_keys=True)
+            if signature in seen_tool_calls:
+                log.warning(
+                    "AI tool loop blocked duplicate call guild=%s channel=%s user=%s tool=%s step=%s",
+                    guild.id,
+                    channel_id,
+                    user.id,
+                    tool_name,
+                    _step + 1,
+                )
+                tool_outputs.append(
+                    f"[TOOL_RESULT:{tool_name}]\n"
+                    "같은 인자의 도구 호출은 이미 실행되었습니다. 기존 결과로 답변하세요."
+                )
+                needs_finalization = True
+                break
+            seen_tool_calls.add(signature)
+            log.info(
+                "AI tool call guild=%s channel=%s user=%s tool=%s step=%s/%s",
+                guild.id,
+                channel_id,
+                user.id,
+                tool_name,
+                _step + 1,
+                max(1, LLM_TOOL_MAX_STEPS),
+            )
+
             result = await self.run_tool(tool_context, tool_call)
             if result.final:
+                log.info(
+                    "AI tool returned final result guild=%s channel=%s user=%s tool=%s",
+                    guild.id,
+                    channel_id,
+                    user.id,
+                    tool_name,
+                )
                 answer = result.content
                 if stream_callback:
                     await stream_callback(answer)
@@ -2360,10 +3400,52 @@ class AIConversationService:
             tool_outputs.append(
                 f"[TOOL_RESULT:{tool_call.get('tool')}]\n{result.content[:3500]}"
             )
-            if stream_callback:
-                await stream_callback(f"{tool_call.get('tool')} 도구 실행 완료")
         else:
-            answer = "도구 호출이 반복되어 응답을 중단했어요. 질문을 조금 더 구체적으로 다시 보내주세요."
+            needs_finalization = True
+
+        if needs_finalization:
+            log.info(
+                "AI tool loop entering tool-free finalization guild=%s channel=%s user=%s calls=%s",
+                guild.id,
+                channel_id,
+                user.id,
+                len(seen_tool_calls),
+            )
+            final_prompt = await self.build_prompt(
+                guild.id,
+                user,
+                content,
+                kind,
+                always_reply,
+                media_path=media_path,
+                is_admin=is_admin,
+                tool_outputs=tool_outputs,
+            )
+            final_prompt += (
+                "\n\n이번 응답에서는 도구를 더 호출하지 말고, 위 도구 결과만 사용해 "
+                "사용자에게 보낼 최종 답변을 작성하세요. 도구 호출 JSON을 출력하지 마세요."
+            )
+            if stream_callback:
+                answer = await self.client.generate_stream(
+                    final_prompt,
+                    media_paths=media_paths,
+                    on_update=stream_callback,
+                )
+            else:
+                answer = await self.client.generate(
+                    final_prompt, media_paths=media_paths
+                )
+            if self.extract_tool_call(answer):
+                log.warning(
+                    "AI tool-free finalization still returned a tool call guild=%s channel=%s user=%s",
+                    guild.id,
+                    channel_id,
+                    user.id,
+                )
+                answer = (
+                    "도구 결과를 확인했지만 최종 답변으로 정리하지 못했어요. "
+                    "잠시 후 다시 시도해 주세요."
+                )
 
         if answer.strip().upper() == "NO_REPLY":
             return None
@@ -2433,19 +3515,32 @@ class AIConversationService:
         local_system_prompt = self.load_local_system_prompt()
         permission_label = "서버 관리자" if is_admin else "일반 사용자"
         permission_instruction = (
-            "The user is a Discord server administrator. You may answer admin-operation questions."
+            "The user is a Discord server administrator. For moderation actions such as timeout, kick, ban, or unban, call the discord_moderation tool. For Discord actions such as sending/editing/deleting messages, creating or editing threads, pinning, reactions, mentions, or polls, call the discord_action tool."
             if is_admin
-            else "The user is not an administrator. Do not perform or bypass admin-only operations; tell them to ask an admin."
+            else "The user is not an administrator. Do not perform or bypass admin-only operations, Discord write actions, moderation, mass mentions, pins, polls, or thread management; tell them to ask an admin."
         )
         return f"""
 You are a friendly Discord assistant.
 Reply in Korean with a warm, natural, slightly casual tone. Be concise, but not stiff.
+Internal thinking is allowed with moderate effort when the request is ambiguous, analytical, or tool-related. Never expose hidden reasoning, raw thinking, analysis, chain-of-thought, or `<think>` tags in the user-facing answer. You may include a short user-facing rationale or interpretation summary when it helps the answer.
+Write the user-facing answer in Korean only unless the user explicitly asks for another language. Do not mix Chinese, Japanese, or English fragments into Korean sentences. Do not use Hanja or Chinese characters; use Hangul words instead.
+If the user asks to interpret an ambiguous, awkward, or mistranslated sentence, say it is ambiguous first, then give 1-3 plausible interpretations. Do not force one literal meaning or invent extra context.
 Use only Discord-supported Markdown: plain text, newlines, `- ` lists, `1. ` lists, bold, italic, underline, strikethrough, inline code, code blocks, and URLs.
 Do not output HTML, Markdown tables, headings, checkboxes, footnotes, collapsible syntax, LaTeX math, raw mass mentions, hidden reasoning, analysis, chain-of-thought, `<think>` tags, or labels like Final/Answer/Analysis.
 If you do not know, say you do not know. Do not invent sources, facts, URLs, memories, or server context.
 Only the current user's memory and last 3 direct messages are included. For server-wide context, other users, Discord channel history, or DB history, call a tool.
 Call at most one tool before the final answer unless absolutely necessary.
-When a tool is needed, output exactly one JSON object and no other text. If no tool is needed, answer normally.
+Tool-call JSON is an internal command, not user-facing text.
+When a tool is needed, output exactly one JSON object and no other text, prefix, explanation, or code fence.
+If the next best response is asking the user for missing information, call ask_user instead of asking in natural prose.
+For ask_user, put only the short Korean follow-up question in the question field.
+The ask_user question must be directly about the missing information in the current request; do not ask about saving, memory, or unrelated context.
+For music recommendation requests with missing genre, topic, mood, language, artist, or similar preferences, call ask_user first.
+For poll/vote requests with a question/topic and at least two options, call discord_action with action=create_poll immediately; do not ask a follow-up.
+For thread, pin, unpin, reaction, mention, message send/edit/delete, or poll requests from an admin, call discord_action instead of explaining steps.
+After receiving tool results, answer naturally and never mention tool names, JSON, or internal commands.
+For normal final answers, stop immediately after the answer. Do not continue with extra turns, analysis, or follow-up prompts.
+If no tool is needed, answer normally.
 
 Tools:
 {self.tool_registry.instructions()}{voice_instruction}
@@ -2489,14 +3584,11 @@ Current user: {permission_label}
         return query[:300] or None
 
     def extract_tool_call(self, answer: str) -> dict[str, object] | None:
-        data = extract_json_object(answer)
-        if not data:
-            return None
-        tool = str(data.get("tool") or "").strip().lower()
-        if tool not in self.tool_registry.names():
-            return None
-        data["tool"] = tool
-        return data
+        for data in extract_json_objects(answer):
+            tool_call = normalize_tool_call(data, self.tool_registry.names())
+            if tool_call:
+                return tool_call
+        return None
 
     def build_search_answer_prompt(
         self,
@@ -2817,7 +3909,23 @@ class Music(commands.Cog):
         lowered = query.lower()
         return "list=" in lowered or "/playlist" in lowered
 
-    def track_from_data(self, query: str, data: dict) -> Track:
+    @staticmethod
+    def is_youtube_video_url(url: str | None) -> bool:
+        if not url:
+            return False
+        try:
+            hostname = (urlparse(url).hostname or "").lower()
+        except ValueError:
+            return False
+        return hostname in {
+            "youtube.com",
+            "www.youtube.com",
+            "m.youtube.com",
+            "music.youtube.com",
+            "youtu.be",
+        }
+
+    def track_from_data(self, query: str, data: dict, *, show_video: bool = False) -> Track:
         stream_url = data.get("url")
         title = data.get("title")
         if not stream_url or not title:
@@ -2828,15 +3936,18 @@ class Music(commands.Cog):
             title=title,
             stream_url=stream_url,
             webpage_url=data.get("webpage_url"),
+            show_video=show_video,
         )
 
-    async def extract_track(self, query: str) -> Track:
-        tracks = await self.extract_tracks(query)
+    async def extract_track(self, query: str, *, show_video: bool = False) -> Track:
+        tracks = await self.extract_tracks(query, show_video=show_video)
         if not tracks:
             raise MusicError("검색 결과가 없어요.")
         return tracks[0]
 
-    async def extract_tracks(self, query: str) -> list[Track]:
+    async def extract_tracks(
+        self, query: str, *, show_video: bool = False
+    ) -> list[Track]:
         loop = asyncio.get_running_loop()
         allow_playlist = self.is_playlist_query(query)
 
@@ -2865,7 +3976,11 @@ class Music(commands.Cog):
                 tracks = []
                 for entry in entries[:MAX_PLAYLIST_TRACKS]:
                     try:
-                        tracks.append(self.track_from_data(query, entry))
+                        tracks.append(
+                            self.track_from_data(
+                                query, entry, show_video=show_video
+                            )
+                        )
                     except MusicError:
                         continue
                 if not tracks:
@@ -2873,7 +3988,7 @@ class Music(commands.Cog):
                 return tracks
             data = entries[0]
 
-        return [self.track_from_data(query, data)]
+        return [self.track_from_data(query, data, show_video=show_video)]
 
     def ffmpeg_options_for(self, track: Track) -> dict[str, str]:
         options = dict(FFMPEG_OPTIONS)
@@ -2895,8 +4010,6 @@ class Music(commands.Cog):
 
         voice_client = interaction.guild.voice_client
         if voice_client is None:
-            if voice_recv is not None:
-                return await voice_state.channel.connect(cls=voice_recv.VoiceRecvClient)
             return await voice_state.channel.connect()
 
         if voice_client.channel != voice_state.channel:
@@ -2913,8 +4026,6 @@ class Music(commands.Cog):
 
         voice_client = guild.voice_client
         if voice_client is None:
-            if voice_recv is not None:
-                return await voice_state.channel.connect(cls=voice_recv.VoiceRecvClient)
             return await voice_state.channel.connect()
 
         if voice_client.channel != voice_state.channel:
@@ -3028,25 +4139,35 @@ class Music(commands.Cog):
                 await channel.send(f"재생을 시작하지 못했어요: {exc}")
                 start_failed = True
             else:
-                started_title = format_track_link(track, suppress_embed=True)
+                started_title = format_track_link(
+                    track, suppress_embed=not track.show_video
+                )
 
         if start_failed:
             await self.start_next(guild, channel)
             return
 
         if started_title:
-            if state.current and state.current.start_time > 0:
-                await send_message(
-                    channel,
-                    f"지금 재생중: {started_title} ({format_timestamp(state.current.start_time)}부터)",
-                    suppress_embeds=True,
+            current_track = state.current
+            show_video = bool(current_track and current_track.show_video)
+            video_url = current_track.webpage_url if current_track else None
+            if current_track and current_track.start_time > 0:
+                content = (
+                    f"지금 재생중: {started_title} "
+                    f"({format_timestamp(current_track.start_time)}부터)"
                 )
             else:
+                content = f"지금 재생중: {started_title}"
+
+            if show_video and video_url:
+                content += f"\n같이 보기: {video_url}"
                 await send_message(
                     channel,
-                    f"지금 재생중: {started_title}",
-                    suppress_embeds=True,
+                    content,
+                    suppress_embeds=False,
                 )
+            else:
+                await send_message(channel, content, suppress_embeds=True)
 
     async def after_track(
         self,
@@ -3074,13 +4195,18 @@ class Music(commands.Cog):
     @app_commands.command(
         name="play", description="노래를 대기열에 추가하고 재생합니다."
     )
-    @app_commands.describe(query="URL 또는 검색어")
+    @app_commands.describe(
+        query="URL 또는 검색어",
+        video="YouTube 같이 보기 링크를 표시합니다. 기본값은 false입니다.",
+    )
     @app_commands.guild_only()
-    async def play(self, interaction: discord.Interaction, query: str) -> None:
+    async def play(
+        self, interaction: discord.Interaction, query: str, video: bool = False
+    ) -> None:
         await interaction.response.defer()
         try:
             await self.connect_author(interaction)
-            tracks = await self.extract_tracks(query)
+            tracks = await self.extract_tracks(query, show_video=video)
         except MusicError as exc:
             await interaction.followup.send(str(exc))
             return
@@ -3089,19 +4215,84 @@ class Music(commands.Cog):
         self.remember_text_channel(interaction.guild, interaction.channel)
         state.queue.extend(tracks)
         if len(tracks) == 1:
+            content = (
+                f"대기열에 추가했어요: "
+                f"{format_track_link(tracks[0], suppress_embed=not video)}"
+            )
+            if video and tracks[0].webpage_url:
+                content += f"\n같이 보기: {tracks[0].webpage_url}"
             await send_interaction(
                 interaction,
-                f"대기열에 추가했어요: {format_track_link(tracks[0], suppress_embed=True)}",
-                suppress_embeds=True,
+                content,
+                suppress_embeds=not video,
             )
         else:
+            content = (
+                f"playlist에서 {len(tracks)}곡을 대기열에 추가했어요. "
+                f"첫 곡: {format_track_link(tracks[0], suppress_embed=not video)}"
+            )
+            if video:
+                content += "\n영상 표시는 이 명령으로 추가한 곡에만 적용돼요."
             await send_interaction(
                 interaction,
-                f"playlist에서 {len(tracks)}곡을 대기열에 추가했어요. "
-                f"첫 곡: {format_track_link(tracks[0], suppress_embed=True)}",
-                suppress_embeds=True,
+                content,
+                suppress_embeds=not video,
             )
         await self.start_next(interaction.guild, interaction.channel)
+
+    @app_commands.command(
+        name="watch", description="Discord Activity에서 YouTube 영상을 함께 봅니다."
+    )
+    @app_commands.describe(query="YouTube URL 또는 검색어")
+    @app_commands.guild_only()
+    async def watch(self, interaction: discord.Interaction, query: str) -> None:
+        if not ACTIVITY_PUBLIC_URL:
+            await send_interaction(
+                interaction,
+                "같이 보기 Activity가 아직 공개 URL로 설정되지 않았어요. "
+                "관리자가 ACTIVITY_PUBLIC_URL과 Discord Developer Portal의 Activity URL Mapping을 설정해 주세요.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            voice_client = await self.connect_author(interaction)
+            track = await self.extract_track(query)
+        except MusicError as exc:
+            await send_interaction(interaction, str(exc), ephemeral=True)
+            return
+
+        if not self.is_youtube_video_url(track.webpage_url):
+            await send_interaction(
+                interaction,
+                "같이 보기는 YouTube 영상만 지원해요. YouTube URL이나 검색어를 입력해 주세요.",
+                ephemeral=True,
+            )
+            return
+
+        state = self.state_for(interaction.guild)
+        state.queue.clear()
+        state.replay_current = None
+        state.current = None
+        if voice_client.is_playing() or voice_client.is_paused():
+            self.stop_playback(voice_client)
+
+        await watch_party_hub.set_video(
+            voice_client.channel.id, track.title, track.webpage_url
+        )
+        try:
+            await interaction.response.launch_activity()
+        except discord.HTTPException as exc:
+            await interaction.followup.send(
+                "Activity를 실행하지 못했어요. Discord Developer Portal에서 Activities를 활성화하고 URL Mapping을 확인해 주세요.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(
+            f"같이 보기 준비 완료: {format_track_link(track)}\n{ACTIVITY_PUBLIC_URL}/",
+            suppress_embeds=False,
+        )
 
     @app_commands.command(
         name="seek", description="현재 영상/곡을 지정한 timestamp로 이동합니다."
@@ -4166,14 +5357,29 @@ class AI(commands.Cog):
         if not message.attachments:
             return None
 
-        attachment = message.attachments[0]
-        suffix = Path(attachment.filename).suffix.lower()
-        if suffix not in AUDIO_SUFFIXES | IMAGE_SUFFIXES:
+        attachment: discord.Attachment | None = None
+        suffix = ""
+        for candidate in message.attachments:
+            candidate_suffix = Path(candidate.filename).suffix.lower()
+            content_type = str(candidate.content_type or "").split(";", 1)[0].lower()
+            if candidate_suffix in AUDIO_SUFFIXES | IMAGE_SUFFIXES:
+                attachment = candidate
+                suffix = candidate_suffix
+                break
+            if content_type in IMAGE_CONTENT_TYPE_SUFFIXES:
+                attachment = candidate
+                suffix = IMAGE_CONTENT_TYPE_SUFFIXES[content_type]
+                break
+
+        if attachment is None:
             return None
 
         attachment_dir = DATA_DIR / "attachments"
         attachment_dir.mkdir(parents=True, exist_ok=True)
-        out_path = attachment_dir / f"{message.id}_{attachment.filename}"
+        filename = Path(attachment.filename).name
+        if suffix and Path(filename).suffix.lower() != suffix:
+            filename = f"{Path(filename).stem}{suffix}"
+        out_path = attachment_dir / f"{message.id}_{filename}"
         await attachment.save(out_path)
         if suffix in AUDIO_SUFFIXES and suffix != ".wav":
             return await self.convert_audio_to_wav(out_path)
@@ -4278,7 +5484,7 @@ class AI(commands.Cog):
 
         if voice_client is None:
             voice_client = await voice_state.channel.connect(
-                cls=voice_recv.VoiceRecvClient
+                cls=SafeVoiceRecvClient
             )
         elif voice_client.channel != voice_state.channel:
             await voice_client.move_to(voice_state.channel)
@@ -4403,12 +5609,7 @@ class AI(commands.Cog):
 
         voice_client = interaction.guild.voice_client
         if voice_client is None:
-            if voice_recv is not None:
-                voice_client = await voice_state.channel.connect(
-                    cls=voice_recv.VoiceRecvClient
-                )
-            else:
-                voice_client = await voice_state.channel.connect()
+            voice_client = await voice_state.channel.connect()
         elif voice_client.channel != voice_state.channel:
             await voice_client.move_to(voice_state.channel)
 
@@ -4705,6 +5906,8 @@ tool_registry.register(AskUserTool())
 if WEB_SEARCH_ENABLED:
     tool_registry.register(WebSearchTool(web_search_client))
 tool_registry.register(DiscordContextTool())
+tool_registry.register(DiscordModerationTool())
+tool_registry.register(DiscordActionTool())
 tool_registry.register(MusicQueueTool())
 tool_registry.register(MusicRecommendTool())
 conversation_service = AIConversationService(
@@ -4746,29 +5949,68 @@ async def on_app_command_error(
         interaction, f"명령어 처리 중 오류가 발생했어요: {error}", ephemeral=True
     )
 
+async def activity_index(_request: web.Request) -> web.FileResponse:
+    return web.FileResponse(ACTIVITY_DIR / "index.html")
 
-async def handle_health_check(
-    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-) -> None:
-    try:
-        await asyncio.wait_for(reader.read(1024), timeout=1)
-    except asyncio.TimeoutError:
-        pass
 
-    body = b"OK"
-    writer.write(
-        b"HTTP/1.1 200 OK\r\n"
-        b"Content-Type: text/plain\r\n"
-        b"Content-Length: 2\r\n"
-        b"Connection: close\r\n"
-        b"\r\n" + body
+async def activity_config(_request: web.Request) -> web.Response:
+    config = {
+        "clientId": str(bot.application_id or ""),
+        "publicUrl": ACTIVITY_PUBLIC_URL,
+    }
+    return web.Response(
+        text=f"window.WATCH_PARTY_CONFIG = {json.dumps(config)};",
+        content_type="application/javascript",
     )
-    await writer.drain()
-    writer.close()
-    await writer.wait_closed()
 
 
-async def start_health_server() -> asyncio.Server | None:
+async def watch_party_websocket(request: web.Request) -> web.WebSocketResponse:
+    websocket = web.WebSocketResponse(heartbeat=30)
+    await websocket.prepare(request)
+    channel_id: int | None = None
+
+    try:
+        async for message in websocket:
+            if message.type is not aiohttp.WSMsgType.TEXT:
+                continue
+            try:
+                payload = json.loads(message.data)
+            except json.JSONDecodeError:
+                await websocket.send_json({"type": "error", "message": "Invalid JSON."})
+                continue
+            if not isinstance(payload, dict):
+                continue
+
+            if payload.get("type") == "join":
+                raw_channel_id = payload.get("channel_id")
+                if (
+                    channel_id is not None
+                    or not isinstance(raw_channel_id, str)
+                    or not raw_channel_id.isdecimal()
+                ):
+                    await websocket.send_json(
+                        {"type": "error", "message": "Invalid channel."}
+                    )
+                    continue
+                channel_id = int(raw_channel_id)
+                await watch_party_hub.join(channel_id, websocket)
+                continue
+
+            if payload.get("type") == "sync" and channel_id is not None:
+                await watch_party_hub.update(
+                    channel_id, payload.get("position"), payload.get("playing")
+                )
+    finally:
+        await watch_party_hub.leave(channel_id, websocket)
+
+    return websocket
+
+
+async def health_check(_request: web.Request) -> web.Response:
+    return web.Response(text="OK")
+
+
+async def start_web_server() -> web.AppRunner | None:
     if not PORT:
         return None
 
@@ -4777,16 +6019,31 @@ async def start_health_server() -> asyncio.Server | None:
     except ValueError as exc:
         raise RuntimeError("PORT must be a number.") from exc
 
-    server = await asyncio.start_server(handle_health_check, HEALTH_HOST, port)
-    print(f"Health check listening on {HEALTH_HOST}:{port}")
-    return server
+    app = web.Application()
+    app.router.add_get("/", activity_index)
+    app.router.add_get("/health", health_check)
+    app.router.add_get("/activity/", activity_index)
+    app.router.add_get("/activity/config.js", activity_config)
+    app.router.add_get("/activity/ws", watch_party_websocket)
+    app.router.add_static("/activity/assets/", ACTIVITY_DIR / "assets")
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, HEALTH_HOST, port)
+    await site.start()
+    print(f"HTTP server listening on {HEALTH_HOST}:{port}")
+    return runner
 
 
 async def main() -> None:
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     if not TOKEN:
         raise RuntimeError("DISCORD_TOKEN environment variable is required.")
 
-    health_server = await start_health_server()
+    web_runner = await start_web_server()
     try:
         async with bot:
             await bot.add_cog(Music(bot))
@@ -4796,9 +6053,8 @@ async def main() -> None:
             )
             await bot.start(TOKEN)
     finally:
-        if health_server:
-            health_server.close()
-            await health_server.wait_closed()
+        if web_runner:
+            await web_runner.cleanup()
 
 
 if __name__ == "__main__":
