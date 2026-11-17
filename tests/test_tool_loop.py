@@ -36,6 +36,18 @@ class FakeRegistry:
 
 
 class ToolLoopRegressionTest(unittest.IsolatedAsyncioTestCase):
+    async def test_latest_news_search_uses_focused_dated_feed_before_backup(self) -> None:
+        question = "웹 검색 가능해? 수능 관련해서 최신 뉴스 몇 개만 가져와봐"
+        client = bot.WebSearchClient(True, 3)
+        article = bot.WebSearchResult("수능 예비소집", "https://example.org/news", "날짜: 2026-11-18")
+        client._search_news_feed = AsyncMock(side_effect=[[article], []])
+        with patch.object(client, "_search_sync", return_value=[article]) as backup:
+            self.assertEqual(await client.search(bot.proactive_web_query(question)), [article])
+            client._search_news_feed.assert_awaited_once_with("수능 when:2d")
+            backup.assert_not_called()
+            self.assertEqual(await client.search(question), [article])
+            backup.assert_called_once_with(question)
+
     async def test_meme_lookup_searches_before_generating_an_answer(self) -> None:
         service = bot.AIConversationService(
             SimpleNamespace(), FakeStore(), SimpleNamespace(generate=AsyncMock(return_value="검색한 답변")),

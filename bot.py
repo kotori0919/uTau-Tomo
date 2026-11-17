@@ -2440,6 +2440,24 @@ class FallbackLLMClient:
                 ) from fallback_error
 
 
+NEWS_LOOKUP = re.compile(r"뉴스|기사|최신\s*소식|최근\s*소식|\bnews\b", re.IGNORECASE)
+NEWS_RECENCY = re.compile(r"최신|최근|오늘|속보|\b(?:latest|recent|today|breaking)\b", re.IGNORECASE)
+
+
+def news_search_topic(query: str) -> str:
+    topic = re.sub(
+        r"^\s*(?:웹\s*검색|인터넷\s*검색)\s*가능(?:해|한가요|할까|해요)[?!.\s]+",
+        "", query,
+    )
+    topic = re.sub(
+        r"\s*(?:관련(?:해서|한)?\s*)?(?:최신|최근|오늘(?:의)?)\s*(?:뉴스|소식|기사)\s*"
+        r"(?:(?:몇\s*개|\d+\s*개)(?:만)?\s*)?"
+        r"(?:가져와\s*(?:봐|줘)?|찾아\s*(?:봐|줘)?|알려\s*줘|보여\s*줘)?[.!?\s]*$",
+        "", topic,
+    )
+    return topic.strip() or query
+
+
 class WebSearchClient:
     def __init__(self, enabled: bool, max_results: int):
         self.enabled = enabled
@@ -2453,7 +2471,11 @@ class WebSearchClient:
             started = time.monotonic()
             try:
                 results = []
-                if re.search(r"밈|\bmeme\b", query, re.IGNORECASE):
+                if NEWS_LOOKUP.search(query):
+                    topic = news_search_topic(query)
+                    feed_query = f"{topic} when:2d" if NEWS_RECENCY.search(query) else topic
+                    results = await self._search_news_feed(feed_query)
+                elif re.search(r"밈|\bmeme\b", query, re.IGNORECASE):
                     results = await self._search_news_feed(query)
                 if not results:
                     results = await asyncio.wait_for(
@@ -2478,7 +2500,7 @@ class WebSearchClient:
                     response.raise_for_status()
                     payload = await response.read()
             return [
-                WebSearchResult(article.title, article.url, article.body)
+                WebSearchResult(article.title, article.url, f"날짜: {article.published_at}\n{article.body}")
                 for article in parse_feed(payload, "google_news", "Google News")[:self.max_results]
             ]
         except (aiohttp.ClientError, TimeoutError, ValueError, SyntaxError) as exc:
@@ -2490,16 +2512,22 @@ class WebSearchClient:
 
         results: list[WebSearchResult] = []
         with DDGS(timeout=5) as ddgs:
-            if re.search(r"뉴스|소식|기사|news", query, re.IGNORECASE):
+            if NEWS_LOOKUP.search(query):
+                topic = news_search_topic(query)
                 try:
-                    rows = ddgs.news(query, region="kr-kr", backend="bing", max_results=self.max_results)
+                    rows = ddgs.news(
+                        topic, region="us-en" if topic.isascii() else "kr-kr",
+                        backend="bing", max_results=self.max_results,
+                        **({"timelimit": "d"} if NEWS_RECENCY.search(query) else {}),
+                    )
                 except Exception as exc:
-                    log.warning("News search failed error=%s; trying web search", type(exc).__name__)
+                    log.warning("Backup news search failed error=%s", type(exc).__name__)
                     rows = []
             else:
-                rows = []
-            if not rows:
-                rows = ddgs.text(query, region="kr-kr", backend="bing", max_results=self.max_results)
+                rows = ddgs.text(
+                    query, region="us-en" if query.isascii() else "kr-kr",
+                    backend="duckduckgo,yahoo", max_results=self.max_results,
+                )
             for result in rows:
                 title = str(result.get("title") or "").strip()
                 url = str(result.get("href") or result.get("url") or "").strip()

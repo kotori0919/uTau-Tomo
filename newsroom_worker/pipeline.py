@@ -47,14 +47,16 @@ class NewsroomPipeline:
             repo_state_default(settings.github["repo"], settings.github["branch"]),
         )
 
-    async def _selection_log(self, text: str) -> None:
+    async def _selection_log(self, text: str) -> bool:
         try:
-            if not await self.publisher.post(
+            if await self.publisher.post(
                 self.settings.channels["selection_log"], text[:2000]
             ):
-                log.warning("Selection log could not be posted")
+                return not self.settings.dry_run
+            log.warning("Selection log could not be posted")
         except Exception as exc:
             log.warning("Selection log failed: %s", exc)
+        return False
 
     async def run_news(self) -> dict[str, Any]:
         state, _healthy = self.news_state.load()
@@ -252,9 +254,9 @@ class NewsroomPipeline:
             )
         )
         if state.get("lastLogDate") != now.date().isoformat():
-            await self._selection_log("**STN 뉴스룸 수집 요약**\n" + "\n".join(report))
-            state["lastLogDate"] = now.date().isoformat()
-            self.news_state.save(state)
+            if await self._selection_log("**STN 뉴스룸 수집 요약**\n" + "\n".join(report)):
+                state["lastLogDate"] = now.date().isoformat()
+                self.news_state.save(state)
         return {"stats": dict(stats), "report": report}
 
     async def run_repo(self) -> dict[str, Any]:

@@ -37,6 +37,28 @@ class FeedTests(unittest.TestCase):
 
 
 class RoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_daily_report_retries_failed_delivery_and_records_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = replace(Settings.from_env(Path.cwd()), dry_run=False,
+                               state_path=Path(directory) / "state.json",
+                               repo_state_path=Path(directory) / "repo.json")
+            pipeline = NewsroomPipeline(settings, None)
+            now = time.time()
+            pipeline.news_state.save({"editorialModel": settings.embedding_model,
+                                      "lastEditorialImport": now, "lastBrowserPoll": now,
+                                      "lastThreadsPoll": now})
+            pipeline.publisher.post = AsyncMock(side_effect=[False, OSError("connection lost"), True])
+            with patch("newsroom_worker.pipeline.collect_feeds", AsyncMock(return_value=[])):
+                for _ in range(2):
+                    await pipeline.run_news()
+                    self.assertNotIn("lastLogDate", pipeline.news_state.load()[0])
+                await pipeline.run_news()
+                self.assertEqual(pipeline.news_state.load()[0]["lastLogDate"],
+                                 datetime.now(timezone.utc).date().isoformat())
+                await pipeline.run_news()
+            self.assertEqual(pipeline.publisher.post.await_count, 3)
+            self.assertEqual(pipeline.publisher.post.await_args.args[0], settings.channels["selection_log"])
+
     async def test_priority_threads_posts_without_models_or_news_quota_and_retries(self):
         with tempfile.TemporaryDirectory() as directory:
             settings = replace(Settings.from_env(Path.cwd()),
