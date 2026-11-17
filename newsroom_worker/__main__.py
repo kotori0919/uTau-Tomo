@@ -19,7 +19,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="STN newsroom worker")
     parser.add_argument("command", choices=("run", "once", "check"))
     parser.add_argument(
-        "target", nargs="?", choices=("all", "news", "repo"), default="all"
+        "target", nargs="?", choices=("all", "news"), default="all"
     )
     return parser.parse_args()
 
@@ -75,8 +75,6 @@ async def run_command(args: argparse.Namespace, settings: Settings) -> None:
                 raise RuntimeError("; ".join(errors))
             await Scheduler(pipeline).run()
             return
-        if args.target in {"all", "repo"}:
-            print(await pipeline.run_repo())
         if args.target in {"all", "news"}:
             print(await pipeline.run_news())
 

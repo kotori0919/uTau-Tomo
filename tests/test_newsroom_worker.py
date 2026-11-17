@@ -15,7 +15,7 @@ from newsroom_worker.discord_client import format_commit_message
 from newsroom_worker.intelligence import IntelligenceClient
 from newsroom_worker.models import Article, canonicalize_url
 from newsroom_worker.pipeline import NewsroomPipeline
-from newsroom_worker.scheduler import seconds_until_news_run
+from newsroom_worker.scheduler import Scheduler, seconds_until_news_run
 from newsroom_worker.state import AtomicJsonState
 
 
@@ -122,6 +122,17 @@ class NewsroomUnitTests(unittest.TestCase):
 
 
 class RepositoryIdempotencyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_scheduler_runs_news_without_repository_updates(self) -> None:
+        scheduler = Scheduler(SimpleNamespace())
+        calls = []
+
+        async def news_loop() -> None:
+            calls.append("news")
+
+        scheduler._news_loop = news_loop
+        await scheduler.run()
+        self.assertEqual(calls, ["news"])
+
     async def test_new_commit_posts_once_and_second_run_posts_zero(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

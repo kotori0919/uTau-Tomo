@@ -35,14 +35,6 @@ class Scheduler:
             except Exception:
                 log.exception("News run failed")
 
-    async def _run_repo(self) -> None:
-        async with self.lock:
-            try:
-                result = await self.pipeline.run_repo()
-                log.info("Repository run completed result=%s", result)
-            except Exception:
-                log.exception("Repository run failed")
-
     async def _news_loop(self) -> None:
         await self._run_news()
         while True:
@@ -51,13 +43,5 @@ class Scheduler:
             await asyncio.sleep(delay)
             await self._run_news()
 
-    async def _repo_loop(self) -> None:
-        await self._run_repo()
-        while True:
-            delay = 6 * 60 * 60 + random.uniform(-300, 300)
-            log.info("Next repository run in %.0f seconds", delay)
-            await asyncio.sleep(delay)
-            await self._run_repo()
-
     async def run(self) -> None:
-        await asyncio.gather(self._news_loop(), self._repo_loop())
+        await self._news_loop()

@@ -1,4 +1,4 @@
-# HD Music Bot
+# uTau-Tomo
 
 A Discord slash-command music bot with configurable local LLM chat memory, voice-channel conversation, and CPU Supertonic 3 TTS.
 
@@ -236,10 +236,9 @@ Keep the API key in `.env`; do not put the real credential in tracked files.
 
 ## STN Newsroom Worker
 
-`newsroom_worker` publishes repository updates every six hours and runs the
-Samsung Display, Samsung Semiconductor, and Threads collectors at 08:30 KST
+`newsroom_worker` runs the Samsung Display, Samsung Semiconductor, and Threads collectors at 08:30 KST
 with a five-minute jitter. Channel IDs, source URLs, filtering anchors, limits,
-and the watched repository live in `config/newsroom.json`.
+live in `config/newsroom.json`. Repository update notifications are disabled.
 
 The two state files are written through a temporary file and `os.replace`.
 On the first run, or after unreadable state, the worker seeds the current URLs,

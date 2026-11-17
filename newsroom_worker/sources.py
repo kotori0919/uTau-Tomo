@@ -18,7 +18,7 @@ from .models import Article, SourceBatch, canonicalize_url
 
 log = logging.getLogger(__name__)
 KST = ZoneInfo("Asia/Seoul")
-USER_AGENT = "STN-Newsroom-Worker/1.0 (+https://github.com/kotori0919/dimigo-HD-Music-Bot)"
+USER_AGENT = "STN-Newsroom-Worker/1.0 (+https://github.com/kotori0919/uTau-Tomo)"
 
 
 def _published_at(text: str) -> str | None:
