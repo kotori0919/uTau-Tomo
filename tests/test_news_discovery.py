@@ -43,7 +43,10 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
                                state_path=Path(directory) / "state.json",
                                repo_state_path=Path(directory) / "repo.json")
             pipeline = NewsroomPipeline(settings, None)
-            article = Article("threads_choi_openai", "https://www.threads.com/@choi.openai/post/test", "짧은 글", "기사 링크")
+            article = Article("threads_choi_openai", "https://www.threads.com/@choi.openai/post/test",
+                              "짧은 글", "기사 링크", datetime.now(timezone.utc).isoformat())
+            old = replace(article, url=article.url + "-old", published_at="2020-01-01T00:00:00Z")
+            undated = replace(article, url=article.url + "-undated", published_at=None)
             now = time.time()
             pipeline.news_state.save({"editorialModel": settings.embedding_model,
                                       "lastEditorialImport": now, "lastBrowserPoll": now,
@@ -58,7 +61,7 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
                 "newsroom_worker.pipeline.BrowserSources"
             ) as browser:
                 browser.return_value.__aenter__.return_value.collect_threads = AsyncMock(
-                    return_value=SourceBatch(article.source, [article])
+                    return_value=SourceBatch(article.source, [article, old, undated])
                 )
                 for _ in range(3):
                     state, _ = pipeline.news_state.load()

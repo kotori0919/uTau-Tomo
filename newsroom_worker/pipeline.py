@@ -79,6 +79,9 @@ class NewsroomPipeline:
                 for article in reversed(threads.articles):
                     if article.url in posted:
                         continue
+                    if not is_fresh(article, now, int(self.settings.config.get("maxArticleAgeHours", 24))):
+                        stats["threads_stale_or_undated"] += 1
+                        continue
                     excerpt = article.body[:1200]
                     message = f"**Threads @choi.openai**\n{excerpt}\n{article.url}"
                     if await self.publisher.post(self.settings.channels[THREADS_SOURCE], message):
@@ -90,6 +93,8 @@ class NewsroomPipeline:
                         stats["threads_publish_failed"] += 1
                 state["lastThreadsPoll"] = now.timestamp()
                 self.news_state.save(state)
+                log.info("Threads delivery posted=%s stale_or_undated=%s", stats["threads_posted"],
+                         stats["threads_stale_or_undated"])
             except Exception:
                 log.exception("Priority Threads delivery failed")
 

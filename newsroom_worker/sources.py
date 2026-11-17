@@ -37,6 +37,14 @@ def _published_at(text: str) -> str | None:
     return None
 
 
+def _threads_published_at(value: str) -> str | None:
+    try:
+        published = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return published.isoformat() if published.utcoffset() is not None else None
+
+
 def _unique_links(rows: list[dict[str, Any]], predicate: Any) -> list[dict[str, str]]:
     seen: set[str] = set()
     result: list[dict[str, str]] = []
@@ -220,7 +228,7 @@ class BrowserSources:
             rows = await page.locator('a[href*="/post/"]').evaluate_all(
                 """nodes => nodes.map(node => {
                     const root = node.closest('article') || node.closest('[data-pressable-container="true"]') || node.parentElement;
-                    const time = root?.querySelector('time')?.getAttribute('datetime') || '';
+                    const time = node.querySelector('time[datetime]')?.getAttribute('datetime') || '';
                     return {href: node.href, text: (root?.innerText || '').trim(), time};
                 })"""
             )
@@ -230,8 +238,11 @@ class BrowserSources:
                 and "/@choi.openai/post/" in urlsplit(href).path,
             )
             by_url: dict[str, dict[str, Any]] = {}
+            times: dict[str, str] = {}
             for row in rows:
                 url = canonicalize_url(str(row.get("href") or ""))
+                if published := _threads_published_at(row["time"]):
+                    times[url] = published
                 if len(row["text"]) > len(by_url.get(url, {}).get("text", "")) or url not in by_url:
                     by_url[url] = row
             limit = int(self.settings.config["limits"]["candidateScan"])
@@ -247,7 +258,7 @@ class BrowserSources:
                         url=link["href"],
                         title=title,
                         body=body,
-                        published_at=_published_at(str(row.get("time") or body)),
+                        published_at=times.get(link["href"]),
                         section="AI Threads",
                     )
                 )
