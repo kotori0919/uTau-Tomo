@@ -2444,21 +2444,44 @@ class WebSearchClient:
     def __init__(self, enabled: bool, max_results: int):
         self.enabled = enabled
         self.max_results = max(1, max_results)
+        self._slots = asyncio.Semaphore(2)
 
     async def search(self, query: str) -> list[WebSearchResult]:
         if not self.enabled:
             return []
-        return await asyncio.to_thread(self._search_sync, query)
+        async with self._slots:
+            started = time.monotonic()
+            try:
+                results = await asyncio.wait_for(
+                    asyncio.to_thread(self._search_sync, query), timeout=20
+                )
+            except Exception as exc:
+                log.warning("Web search failed error=%s elapsed=%.1fs", type(exc).__name__, time.monotonic() - started)
+                return []
+            log.info("Web search completed results=%s elapsed=%.1fs", len(results), time.monotonic() - started)
+            return results
 
     def _search_sync(self, query: str) -> list[WebSearchResult]:
         from ddgs import DDGS
 
         results: list[WebSearchResult] = []
-        with DDGS() as ddgs:
-            for result in ddgs.text(query, max_results=self.max_results):
+        with DDGS(timeout=5) as ddgs:
+            if re.search(r"뉴스|소식|기사|news", query, re.IGNORECASE):
+                try:
+                    rows = ddgs.news(query, region="kr-kr", backend="bing", max_results=self.max_results)
+                except Exception as exc:
+                    log.warning("News search failed error=%s; trying web search", type(exc).__name__)
+                    rows = []
+            else:
+                rows = []
+            if not rows:
+                rows = ddgs.text(query, region="kr-kr", backend="bing", max_results=self.max_results)
+            for result in rows:
                 title = str(result.get("title") or "").strip()
                 url = str(result.get("href") or result.get("url") or "").strip()
                 snippet = str(result.get("body") or "").strip()
+                if result.get("date"):
+                    snippet = f"날짜: {result['date']}\n{snippet}"
                 if title and url:
                     results.append(
                         WebSearchResult(title=title, url=url, snippet=snippet)
