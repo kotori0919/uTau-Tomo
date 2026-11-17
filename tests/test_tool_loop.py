@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 from types import MethodType, SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import bot
 
@@ -36,6 +36,25 @@ class FakeRegistry:
 
 
 class ToolLoopRegressionTest(unittest.IsolatedAsyncioTestCase):
+    async def test_meme_lookup_searches_before_generating_an_answer(self) -> None:
+        service = bot.AIConversationService(
+            SimpleNamespace(), FakeStore(), SimpleNamespace(generate=AsyncMock(return_value="검색한 답변")),
+            SimpleNamespace(names=lambda: {"web_search"}),
+        )
+        service.run_tool = AsyncMock(return_value=bot.ToolResult("URL: https://example.org/meme"))
+        service.build_prompt = AsyncMock(return_value="prompt")
+        service.safe_compress_if_needed = AsyncMock()
+        answer = await service.answer(
+            guild=SimpleNamespace(id=1), channel_id=3,
+            user=SimpleNamespace(id=2, display_name="tester"),
+            content="ram altman 밈에 대해 알려줘", kind="mention",
+        )
+        self.assertEqual(answer, "검색한 답변")
+        self.assertEqual(service.run_tool.await_args.args[1],
+                         {"tool": "web_search", "query": "ram altman meme"})
+        self.assertIn("https://example.org/meme", service.build_prompt.await_args.kwargs["tool_outputs"][0])
+        self.assertIsNone(bot.proactive_web_query("안녕!"))
+
     async def test_tool_limit_gets_one_tool_free_finalization_pass(self) -> None:
         service = bot.AIConversationService.__new__(bot.AIConversationService)
         service.bot = SimpleNamespace()
