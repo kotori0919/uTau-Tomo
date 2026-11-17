@@ -60,8 +60,11 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
             with patch("newsroom_worker.pipeline.collect_feeds", AsyncMock(return_value=[])), patch(
                 "newsroom_worker.pipeline.BrowserSources"
             ) as browser:
+                variant = replace(article, url="http://threads.net/@CHOI.OPENAI/post/test/media?xmt=tracking")
+                self.assertEqual(variant.url, article.url)
                 browser.return_value.__aenter__.return_value.collect_threads = AsyncMock(
-                    return_value=SourceBatch(article.source, [article, old, undated])
+                    side_effect=[SourceBatch(article.source, [candidate, old, undated])
+                                 for candidate in (article, article, variant)]
                 )
                 for _ in range(3):
                     state, _ = pipeline.news_state.load()

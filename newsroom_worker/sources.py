@@ -225,11 +225,23 @@ class BrowserSources:
             await page.locator('[role="dialog"]').evaluate_all(
                 "nodes => nodes.forEach(node => node.remove())"
             )
-            rows = await page.locator('a[href*="/post/"]').evaluate_all(
-                """nodes => nodes.map(node => {
-                    const root = node.closest('article') || node.closest('[data-pressable-container="true"]') || node.parentElement;
-                    const time = node.querySelector('time[datetime]')?.getAttribute('datetime') || '';
-                    return {href: node.href, text: (root?.innerText || '').trim(), time};
+            rows = await page.locator('a[href*="/post/"]:has(time[datetime])').evaluate_all(
+                """nodes => nodes.flatMap(node => {
+                    const cardSelector = 'article, [data-pressable-container="true"]';
+                    const card = node.closest(cardSelector);
+                    const timelineItem = node.closest('[data-pagelet^="threads_profile_posts_timeline_"]');
+                    if (card && timelineItem?.contains(card.parentElement?.closest(cardSelector))) {
+                        return [];
+                    }
+                    const threadRoot = timelineItem && Array.from(timelineItem.querySelectorAll(
+                        'a[href*="/post/"]:has(time[datetime])'
+                    )).find(link => {
+                        const linkCard = link.closest(cardSelector);
+                        return !timelineItem.contains(linkCard?.parentElement?.closest(cardSelector));
+                    });
+                    if (threadRoot && threadRoot.pathname !== node.pathname) return [];
+                    const time = node.querySelector('time[datetime]').getAttribute('datetime');
+                    return [{href: node.href, text: (card || node.parentElement).innerText.trim(), time}];
                 })"""
             )
             links = _unique_links(

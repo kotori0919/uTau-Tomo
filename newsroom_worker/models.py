@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from hashlib import sha256
+import re
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
@@ -14,8 +15,11 @@ def canonicalize_url(url: str) -> str:
     """Return a stable URL suitable for deduplication."""
     parts = urlsplit(url.strip())
     path = parts.path
-    if "threads.com" in parts.netloc and path.endswith("/media"):
-        path = path[: -len("/media")]
+    if parts.hostname in {"threads.com", "www.threads.com", "threads.net", "www.threads.net"}:
+        match = re.fullmatch(r"/(@[\w.]+)/post/([\w-]+)(?:/media)?/?", path)
+        if match:
+            handle, post_id = match.groups()
+            return f"https://www.threads.com/{handle.lower()}/post/{post_id}"
     query = [
         (key, value)
         for key, value in parse_qsl(parts.query, keep_blank_values=True)

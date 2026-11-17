@@ -270,7 +270,8 @@ limited to 120 Korean characters, and are not posted if summarization fails.
 The worker checks public Threads posts from `@choi.openai` each cycle and
 forwards each newly seen post with a verified timestamp within the last 24
 hours to the AI news channel. Delivery uses a source excerpt and original link,
-with URL deduplication. The feed bypasses editorial filters, model calls and
+with post ID deduplication across URL variants. Each profile conversation is
+forwarded through its root post, which links to the full thread. The feed bypasses editorial filters, model calls and
 general news quotas.
 A login wall skips the source for that run.
 
