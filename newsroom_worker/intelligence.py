@@ -59,6 +59,20 @@ class IntelligenceClient:
         self.session = session
         self._knowledge_vectors: list[list[float]] | None = None
         self._promotion_vectors: list[list[float]] | None = None
+        self._route_vectors: list[list[float]] | None = None
+        self._route_keys: list[str] = []
+
+    async def route(self, article: Article) -> tuple[str, float]:
+        anchors = self.settings.config["routingAnchors"]
+        if self._route_vectors is None:
+            self._route_keys = [key for key, values in anchors.items() for _ in values]
+            self._route_vectors = await self.embed_many(
+                [anchor for values in anchors.values() for anchor in values]
+            )
+        vector = (await self.embed_many([article.title + "\n" + article.body[:1500]]))[0]
+        scores = [_cosine(vector, anchor) for anchor in self._route_vectors]
+        best = max(range(len(scores)), key=scores.__getitem__)
+        return self._route_keys[best], scores[best]
 
     @property
     def headers(self) -> dict[str, str]:

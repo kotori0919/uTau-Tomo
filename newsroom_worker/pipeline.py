@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import re
+import hashlib
+from datetime import datetime, timezone, timedelta
 from collections import Counter
 from typing import Any
 
@@ -17,14 +19,11 @@ from .discord_client import (
 from .intelligence import IntelligenceClient
 from .models import Article, SourceBatch, canonicalize_url
 from .sources import BrowserSources, GitHubSource
+from .feeds import collect_feeds
 from .state import AtomicJsonState, news_state_default, repo_state_default
 
 
 log = logging.getLogger(__name__)
-SECURITY_PATTERN = re.compile(
-    r"\bCVE[-\s]?\d|취약점|해킹|랜섬웨어|악성코드|제로데이|보안\s*결함",
-    re.IGNORECASE,
-)
 
 
 class NewsroomPipeline:
@@ -56,13 +55,23 @@ class NewsroomPipeline:
 
     async def run_news(self) -> dict[str, Any]:
         state, _healthy = self.news_state.load()
-        posted = {canonicalize_url(str(url)) for url in state.get("posted", [])}
+        posted = dict.fromkeys(canonicalize_url(str(url)) for url in state.get("posted", []))
+        baseline = dict.fromkeys(state.get("baseline", []))
+        titles = dict.fromkeys(state.get("titleHashes", []))
         initialized = {str(value) for value in state.get("initializedSources", [])}
         empty_runs = Counter(
             {str(k): int(v) for k, v in dict(state.get("emptyRuns", {})).items()}
         )
-        async with BrowserSources(self.settings) as sources:
-            batches = await sources.collect_all()
+        batches = await collect_feeds(self.session, self.settings.config.get("feeds", []))
+        now = datetime.now(timezone.utc)
+        if state.get("dailyDate") != now.date().isoformat():
+            state["dailyDate"] = now.date().isoformat()
+            state["dailyPosted"] = 0
+        browser_due = now.timestamp() - float(state.get("lastBrowserPoll", 0)) >= int(self.settings.config.get("browserPollSeconds", 3600))
+        if browser_due:
+            async with BrowserSources(self.settings) as sources:
+                batches.extend(await sources.collect_all())
+            state["lastBrowserPoll"] = now.timestamp()
 
         stats = Counter()
         report: list[str] = []
@@ -87,21 +96,38 @@ class NewsroomPipeline:
                 continue
             empty_runs[batch.source] = 0
             if batch.source not in initialized:
-                posted.update(article.url for article in batch.articles)
+                baseline.update(dict.fromkeys(article.url for article in batch.articles))
                 initialized.add(batch.source)
                 report.append(
                     f"- {batch.source}: 최초 실행 {len(batch.articles)}건 시드(백필 없음)"
                 )
                 continue
-            unseen = [article for article in batch.articles if article.url not in posted]
+            unseen = [article for article in batch.articles if article.url not in posted and article.url not in baseline]
             unseen.sort(key=lambda article: article.published_at or "", reverse=True)
-            pending.extend(unseen[:per_source_limit])
+            pending.extend(unseen)
             report.append(
                 f"- {batch.source}: 수집 {len(batch.articles)} · 신규 {len(unseen)}"
             )
 
         pending.sort(key=lambda article: article.published_at or "", reverse=True)
-        for article in pending[:total_limit]:
+        source_posts = Counter()
+        for article in pending:
+            if stats["posted"] >= total_limit or int(state.get("dailyPosted", 0)) >= int(self.settings.config["limits"].get("newsDaily", 60)):
+                break
+            if source_posts[article.source] >= per_source_limit or article.url in posted:
+                continue
+            title_hash = hashlib.sha256(re.sub(r"\W+", "", article.title.casefold()).encode()).hexdigest()
+            if title_hash in titles:
+                continue
+            if article.published_at:
+                try:
+                    published = datetime.fromisoformat(article.published_at.replace("Z", "+00:00"))
+                    if published.tzinfo is None:
+                        published = published.replace(tzinfo=timezone.utc)
+                    if published < now - timedelta(hours=int(self.settings.config.get("maxArticleAgeHours", 48))):
+                        continue
+                except ValueError:
+                    continue
             if article.source.startswith("samsung_"):
                 try:
                     decision = await self.intelligence.classify(article)
@@ -122,20 +148,30 @@ class NewsroomPipeline:
                     stats["rejected"] += 1
                     continue
             try:
+                channel_key, route_score = await self.intelligence.route(article)
+                log.info("Embedding route source=%s channel=%s score=%.4f url=%s", article.source, channel_key, route_score, article.url)
+                if route_score < float(self.settings.config.get("routingThreshold", 0.5)):
+                    stats["route_rejected"] += 1
+                    continue
+            except Exception as exc:
+                stats["routing_failed"] += 1
+                log.error("Embedding routing failed url=%s error=%s", article.url, exc)
+                continue
+            try:
                 summary = await self.intelligence.summarize(article)
             except Exception as exc:
                 stats["summary_failed"] += 1
                 log.error("Summary failed url=%s error=%s", article.url, exc)
                 continue
-            channel_key = article.source
-            if article.source == "threads_choi_openai" and SECURITY_PATTERN.search(
-                f"{article.title}\n{article.body}"
-            ):
-                channel_key = "threads_security"
             message = format_news_message(article, summary)
             if await self.publisher.post(self.settings.channels[channel_key], message):
-                posted.add(article.url)
-                state["posted"] = list(posted)[-300:]
+                posted[article.url] = None
+                titles[title_hash] = None
+                source_posts[article.source] += 1
+                state["dailyPosted"] = int(state.get("dailyPosted", 0)) + 1
+                state["posted"] = list(posted)[-5000:]
+                state["titleHashes"] = list(titles)[-5000:]
+                state["baseline"] = list(baseline)[-5000:]
                 state["initializedSources"] = sorted(initialized)
                 state["emptyRuns"] = dict(empty_runs)
                 self.news_state.save(state)
@@ -143,7 +179,9 @@ class NewsroomPipeline:
             else:
                 stats["publish_failed"] += 1
 
-        state["posted"] = list(posted)[-300:]
+        state["posted"] = list(posted)[-5000:]
+        state["titleHashes"] = list(titles)[-5000:]
+        state["baseline"] = list(baseline)[-5000:]
         state["initializedSources"] = sorted(initialized)
         state["emptyRuns"] = dict(empty_runs)
         self.news_state.save(state)
@@ -155,7 +193,10 @@ class NewsroomPipeline:
                 publish_failed=stats["publish_failed"],
             )
         )
-        await self._selection_log("**STN 뉴스룸 수집 요약**\n" + "\n".join(report))
+        if state.get("lastLogDate") != now.date().isoformat():
+            await self._selection_log("**STN 뉴스룸 수집 요약**\n" + "\n".join(report))
+            state["lastLogDate"] = now.date().isoformat()
+            self.news_state.save(state)
         return {"stats": dict(stats), "report": report}
 
     async def run_repo(self) -> dict[str, Any]:

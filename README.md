@@ -236,9 +236,20 @@ Keep the API key in `.env`; do not put the real credential in tracked files.
 
 ## STN Newsroom Worker
 
-`newsroom_worker` runs the Samsung Display, Samsung Semiconductor, and Threads collectors at 08:30 KST
-with a five-minute jitter. Channel IDs, source URLs, filtering anchors, limits,
-live in `config/newsroom.json`. Repository update notifications are disabled.
+`newsroom_worker` checks RSS/Atom feeds and Korean Google News search feeds every
+10 minutes. Sources include Ars Technica, The Verge, BleepingComputer, The Hacker
+News, Hugging Face and arXiv; search feeds discover articles from additional
+publishers. Samsung and Threads browser collectors run hourly. Channel IDs,
+feeds, intervals, routing anchors and limits live in `config/newsroom.json`.
+Repository update notifications are disabled.
+
+Every article is routed by `embeddinggemma-2` using its title and content against
+the technology, AI, hardware, security and research anchor sets. The highest
+cosine similarity selects the channel, subject to a minimum score; source names
+and keyword rules do not select the channel. Failed embeddings defer publication.
+The worker publishes at most 8 items per cycle, 3 per source per cycle and 60
+per UTC day. Only articles from the last 48 hours are considered. New feeds are
+seeded without backfill. URLs and normalized title hashes prevent duplicates.
 
 The two state files are written through a temporary file and `os.replace`.
 On the first run, or after unreadable state, the worker seeds the current URLs,
@@ -249,7 +260,7 @@ Samsung articles must pass both the hard promotion-title rule and the
 `embeddinggemma-2` similarity filter. Summaries use `deepseek-v4.1-flash`, are
 limited to 120 Korean characters, and are not posted if summarization fails.
 Threads is accessed without signing in; a login wall skips that source for the
-run. CVE and hacking-related Threads posts are routed to the security channel.
+run. Threads posts use the same content-based embedding routing as other sources.
 
 The configured gateway counts hidden reasoning inside `max_tokens`, so the
 worker streams with a 2048-token completion budget to obtain final content while

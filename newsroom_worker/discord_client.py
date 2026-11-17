@@ -24,7 +24,7 @@ def _escape_title(value: str) -> str:
 
 
 def format_news_message(article: Article, summary: str) -> str:
-    source = SOURCE_LABELS.get(article.source, article.source)
+    source = str(article.meta.get("source_label") or SOURCE_LABELS.get(article.source, article.source))
     return (
         f"**{_escape_title(article.title)}**\n"
         f"{summary}\n"

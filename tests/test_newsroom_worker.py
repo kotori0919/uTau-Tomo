@@ -15,7 +15,7 @@ from newsroom_worker.discord_client import format_commit_message
 from newsroom_worker.intelligence import IntelligenceClient
 from newsroom_worker.models import Article, canonicalize_url
 from newsroom_worker.pipeline import NewsroomPipeline
-from newsroom_worker.scheduler import Scheduler, seconds_until_news_run
+from newsroom_worker.scheduler import Scheduler
 from newsroom_worker.state import AtomicJsonState
 
 
@@ -108,11 +108,6 @@ class NewsroomUnitTests(unittest.TestCase):
         self.assertIn("**dimigo-HD-Music-Bot 업데이트 · abcdef1**", message)
         self.assertIn("변경: 파일 4개 (+120 / −38)", message)
         self.assertIn("출처: GitHub example/repo (2026.11.17)", message)
-
-    def test_news_schedule_targets_0830_kst(self) -> None:
-        now = datetime(2026, 11, 18, 8, 0, tzinfo=ZoneInfo("Asia/Seoul"))
-        with patch("newsroom_worker.scheduler.random.uniform", return_value=0):
-            self.assertEqual(seconds_until_news_run(now), 30 * 60)
 
     @staticmethod
     def _run(awaitable):

@@ -90,6 +90,7 @@ class Settings:
         if not self.llm_api_key:
             errors.append("LLM_API_KEY or NEWSROOM_LLM_API_KEY is required")
         required_channels = {
+            "technology", "ai", "hardware", "security", "research",
             "github_repo",
             "samsung_display",
             "samsung_semiconductor",
