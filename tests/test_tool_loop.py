@@ -39,18 +39,18 @@ class ToolLoopRegressionTest(unittest.IsolatedAsyncioTestCase):
     async def test_research_reply_passes_exact_discord_reference_to_answer(self) -> None:
         channel = SimpleNamespace(id=10)
         content = "Hugging Face가 OpenRouter를 연동했습니다."
-        quoted = SimpleNamespace(id=11, channel=channel, content=content, embeds=[])
-        channel.fetch_message = AsyncMock(return_value=quoted)
         bot_user = SimpleNamespace(id=12)
+        quoted = SimpleNamespace(id=11, channel=channel, content=content, embeds=[], author=bot_user)
+        channel.fetch_message = AsyncMock(return_value=quoted)
         message = SimpleNamespace(
             guild=SimpleNamespace(id=13), channel=channel,
-            author=SimpleNamespace(bot=False), mentions=[bot_user],
-            content="<@12> 더 조사해보거라",
+            author=SimpleNamespace(bot=False, id=14, display_name="tester"), mentions=[],
+            content="더 조사해보거라",
             reference=SimpleNamespace(type=bot.discord.MessageReferenceType.default,
                                       message_id=11, channel_id=10, resolved=None),
             reply=AsyncMock(), attachments=[],
         )
-        store = SimpleNamespace(is_llm_enabled=AsyncMock(return_value=True))
+        store = SimpleNamespace(is_llm_enabled=AsyncMock(return_value=True), add_message=AsyncMock())
         conversation = SimpleNamespace(answer=AsyncMock(return_value="조사 결과"))
         cog = bot.AI(SimpleNamespace(user=bot_user), store, conversation, None)
         with patch.object(bot, "DiscordStreamEditor", return_value=SimpleNamespace(
@@ -60,10 +60,17 @@ class ToolLoopRegressionTest(unittest.IsolatedAsyncioTestCase):
         channel.fetch_message.assert_awaited_once_with(11)
         self.assertEqual(conversation.answer.await_args.kwargs["reply_context"], content)
         self.assertEqual(conversation.answer.await_args.kwargs["content"], "더 조사해보거라")
+        store.add_message.assert_not_awaited()
+
+        quoted.author = message.author
+        conversation.answer.reset_mock()
+        await cog.on_message(message)
+        conversation.answer.assert_not_awaited()
+        store.add_message.assert_awaited_once()
 
         message.reference.channel_id = 99
         channel.fetch_message.reset_mock()
-        self.assertEqual(await cog.replied_message_context(message), "")
+        self.assertIsNone(await cog.replied_message(message))
         channel.fetch_message.assert_not_awaited()
 
     async def test_reply_research_treats_model_keywords_as_search_query(self) -> None:

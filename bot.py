@@ -5406,8 +5406,12 @@ class AI(commands.Cog):
         if message.author.bot or message.guild is None:
             return
 
-        mentioned = self.bot.user is not None and self.bot.user in message.mentions
-        if message.content.strip() and not mentioned:
+        bot_user = self.bot.user
+        mentioned = bot_user is not None and bot_user in message.mentions
+        original = await self.replied_message(message) if bot_user is not None else None
+        replied_to_bot = original is not None and bot_user is not None and original.author.id == bot_user.id
+        addressed_to_bot = mentioned or replied_to_bot
+        if message.content.strip() and not addressed_to_bot:
             await self.store.add_message(
                 message.guild.id,
                 message.channel.id,
@@ -5418,7 +5422,7 @@ class AI(commands.Cog):
                 message.content,
             )
 
-        if not mentioned:
+        if not addressed_to_bot:
             return
 
         streamer: DiscordStreamEditor | None = None
@@ -5435,7 +5439,7 @@ class AI(commands.Cog):
             if not content:
                 content = "나를 멘션한 사용자에게 자연스럽게 응답해줘."
 
-            reply_context = await self.replied_message_context(message)
+            reply_context = self.reply_context_text(original) if original is not None else ""
             response_message = await message.reply("생각 중...", mention_author=False)
             streamer = DiscordStreamEditor(response_message)
             answer = await self.conversation.answer(
@@ -5462,7 +5466,7 @@ class AI(commands.Cog):
         else:
             await streamer.finish("(응답 없음)")
 
-    async def replied_message_context(self, message: discord.Message) -> str:
+    async def replied_message(self, message: discord.Message) -> discord.Message | None:
         reference = message.reference
         if (
             reference is None
@@ -5470,17 +5474,21 @@ class AI(commands.Cog):
             or reference.message_id is None
             or reference.channel_id != message.channel.id
         ):
-            return ""
+            return None
         original = reference.resolved
         if isinstance(original, discord.DeletedReferencedMessage):
-            return ""
+            return None
         if not isinstance(original, discord.Message):
             try:
                 original = await message.channel.fetch_message(reference.message_id)
             except discord.HTTPException:
-                return ""
+                return None
         if original.id != reference.message_id or original.channel.id != message.channel.id:
-            return ""
+            return None
+        return original
+
+    @staticmethod
+    def reply_context_text(original: discord.Message) -> str:
         text = original.content[:1800]
         if not text.strip():
             text = "\n".join(
