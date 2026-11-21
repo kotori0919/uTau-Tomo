@@ -119,6 +119,11 @@ class NewsroomPipeline:
 
         for batch in batches:
             stats[f"{batch.source}:{batch.status}"] += 1
+            if batch.status == "no_updates":
+                empty_runs[batch.source] = 0
+                alerts.discard(batch.source)
+                report.append(f"- {batch.source}: 신규 소식 없음")
+                continue
             if batch.status == "parse_empty":
                 empty_runs[batch.source] += 1
                 report.append(

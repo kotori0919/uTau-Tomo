@@ -4,10 +4,11 @@ import time
 from datetime import datetime, timezone
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from newsroom_worker.config import Settings
-from newsroom_worker.feeds import parse_feed
+from newsroom_worker.feeds import collect_feeds, parse_feed
 from newsroom_worker.intelligence import IntelligenceClient
 from newsroom_worker.models import Article, SourceBatch
 from newsroom_worker.pipeline import NewsroomPipeline
@@ -37,6 +38,56 @@ class FeedTests(unittest.TestCase):
 
 
 class RoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_feed_collector_distinguishes_empty_entries_from_invalid_entries(self):
+        def response(body):
+            async def chunks(_size):
+                yield body
+            return AsyncMock(__aenter__=AsyncMock(return_value=SimpleNamespace(
+                raise_for_status=lambda: None, content=SimpleNamespace(iter_chunked=chunks)
+            )))
+
+        feeds = [
+            {"id": key, "label": key, "url": f"https://example.org/{key}"}
+            for key in ("weekend", "invalid_item", "html", "empty_atom")
+        ]
+        responses = [
+            response(b"<rss><channel><title>cs.AI updates on arXiv.org</title></channel></rss>"),
+            response(b"<rss><channel><item><title>Invalid paper</title></item></channel></rss>"),
+            response(b"<html><body>Not a feed</body></html>"),
+            response(b'<feed xmlns="http://www.w3.org/2005/Atom"><title>Empty</title></feed>'),
+        ]
+        with patch("aiohttp.ClientSession.get", side_effect=responses):
+            import aiohttp
+
+            async with aiohttp.ClientSession() as session:
+                batches = await collect_feeds(session, feeds)
+        self.assertEqual([batch.status for batch in batches],
+                         ["no_updates", "parse_empty", "error", "no_updates"])
+
+    async def test_empty_feed_clears_pending_parser_warning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Settings.from_env(Path.cwd())
+            settings = replace(base, config={**base.config, "quietHoursKst": None},
+                               state_path=Path(directory) / "state.json")
+            pipeline = NewsroomPipeline(settings, None)
+            now = time.time()
+            source = "feed_arxiv_ai"
+            pipeline.news_state.save({"editorialModel": settings.embedding_model,
+                                      "lastEditorialImport": now, "lastBrowserPoll": now,
+                                      "lastThreadsPoll": now, "emptyRuns": {source: 2},
+                                      "lastLogDate": datetime.now(timezone.utc).date().isoformat(),
+                                      "pendingSourceAlerts": [source]})
+            pipeline.publisher.post = AsyncMock()
+            with patch("newsroom_worker.pipeline.collect_feeds", AsyncMock(
+                return_value=[SourceBatch(source, [], "no_updates")]
+            )):
+                result = await pipeline.run_news()
+            self.assertIn(f"- {source}: 신규 소식 없음", result["report"])
+            state, _ = pipeline.news_state.load()
+            self.assertEqual(state["emptyRuns"][source], 0)
+            self.assertEqual(state["pendingSourceAlerts"], [])
+            pipeline.publisher.post.assert_not_awaited()
+
     async def test_overnight_collection_survives_restart_and_delivers_at_seven_kst(self):
         with tempfile.TemporaryDirectory() as directory:
             settings = replace(Settings.from_env(Path.cwd()), dry_run=False,

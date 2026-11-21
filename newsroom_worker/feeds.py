@@ -18,8 +18,19 @@ def plain_text(value: str) -> str:
 
 
 def parse_feed(payload: bytes, source: str, label: str) -> list[Article]:
+    return _parse_feed_rows(_feed_rows(payload), source, label)
+
+
+def _feed_rows(payload: bytes) -> list[ET.Element]:
     root = ET.fromstring(payload)
-    rows = root.findall(".//item") or root.findall("{http://www.w3.org/2005/Atom}entry")
+    if root.tag == "rss" and root.find("channel") is not None:
+        return root.findall("./channel/item")
+    if root.tag == "{http://www.w3.org/2005/Atom}feed":
+        return root.findall("{http://www.w3.org/2005/Atom}entry")
+    raise ValueError("response is not an RSS or Atom feed")
+
+
+def _parse_feed_rows(rows: list[ET.Element], source: str, label: str) -> list[Article]:
     articles = []
     for row in rows[:30]:
         fields = {node.tag.rsplit("}", 1)[-1]: node for node in row}
@@ -72,7 +83,10 @@ async def collect_feeds(session: aiohttp.ClientSession, feeds: list[dict]) -> li
                             raise ValueError("feed exceeds 2MB")
                         chunks.append(chunk)
                     payload = b"".join(chunks)
-                articles = parse_feed(payload, source, feed["label"])
+                rows = _feed_rows(payload)
+                if not rows:
+                    return SourceBatch(source, [], "no_updates")
+                articles = _parse_feed_rows(rows, source, feed["label"])
                 return SourceBatch(source, articles, "ok" if articles else "parse_empty")
             except Exception as exc:
                 return SourceBatch(source, [], "error", f"{type(exc).__name__}: {str(exc)[:180]}")
